@@ -65,6 +65,7 @@ DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
 DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
+DISABLE_SINK = os.getenv("FLASH_ATTENTION_DISABLE_SINK", "FALSE") == "TRUE"
 
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
 
@@ -451,7 +452,7 @@ if not SKIP_CUDA_BUILD:
     # We want to use the nvcc front end from 12.6 however, since if we use nvcc 12.8
     # Cutlass 3.8 will expect the new data types in cuda.h from CTK 12.8, which we don't have.
     # For CUDA 13.0+, use system nvcc instead of downloading CUDA 12.x toolchain
-    if bare_metal_version >= Version("12.3") and bare_metal_version < Version("13.0") and bare_metal_version != Version("12.8"):
+    if False:
         download_and_copy(
             name="nvcc",
             src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin",
@@ -520,6 +521,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF64"] if DISABLE_HDIMDIFF64 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF192"] if DISABLE_HDIMDIFF192 else [])
+        + (["-DFLASHATTENTION_DISABLE_SINK"] if DISABLE_SINK else [])
     )
 
     DTYPE_FWD_SM80 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
@@ -577,7 +579,7 @@ if not SKIP_CUDA_BUILD:
     
     # Choose between flash_api.cpp and flash_api_stable.cpp based on torch version
     torch_version = parse(torch.__version__)
-    target_version = parse("2.9.0.dev20250830")
+    target_version = parse("99.0.0")
     stable_args = []
       
     if torch_version >= target_version:

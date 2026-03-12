@@ -704,7 +704,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        std::optional<at::Tensor> learnable_sink_
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -856,11 +857,19 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
     auto opts = q.options();
-    auto out_type = q_type == at::ScalarType::Float8_e4m3fn ? at::ScalarType::BFloat16 : q_type;
+    auto default_out_type = q_type == at::ScalarType::Float8_e4m3fn ? at::ScalarType::BFloat16 : q_type;
+    auto out_type = out_.has_value() ? out_.value().scalar_type() : default_out_type;
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.scalar_type() == out_type, "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
+        if (q_type == at::ScalarType::BFloat16) {
+            TORCH_CHECK(
+                out_type == at::ScalarType::BFloat16 || out_type == at::ScalarType::Float,
+                "For BF16 input, output must have dtype BF16 or FP32"
+            );
+        } else {
+            TORCH_CHECK(out_type == default_out_type, "Output tensor must match the selected output dtype");
+        }
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         if (!is_varlen_q) {
@@ -911,6 +920,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
                      attention_chunk,
                      softcap,
                      sm_margin);
+    params.is_fp32 = out_type == at::ScalarType::Float;
     params.total_q = total_q;
     params.total_k = total_k;
     params.b_k = batch_size_k;
@@ -1089,6 +1099,18 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         params.kv_batch_idx = reinterpret_cast<int *>(kv_batch_idx.data_ptr());
     }
 
+    at::Tensor learnable_sink;
+    if (learnable_sink_.has_value()) {
+        learnable_sink = learnable_sink_.value().to(torch::kFloat32);
+        CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
+        TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
+        CHECK_SHAPE(learnable_sink, num_heads);
+        params.learnable_sink_ptr = learnable_sink.data_ptr();
+        params.pack_gqa = false; // Disable pack_gqa if learnable sink is provided
+    } else {
+        params.learnable_sink_ptr = nullptr;
+    }
+
     at::Tensor out_accum, softmax_lse_accum;
     auto outaccum_type = at::ScalarType::Float;
     if (params.num_splits > 1) {
@@ -1102,7 +1124,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             out_accum = torch::empty({params.num_splits, num_heads, total_q, head_size_v}, opts.dtype(outaccum_type));
             softmax_lse_accum = torch::empty({params.num_splits, num_heads, total_q}, opts.dtype(at::kFloat));
         }
-        params.is_fp32 = false;
+        params.is_fp32 = out_type == at::ScalarType::Float;
         params.oaccum_ptr = out_accum.data_ptr();
         params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
         params.oaccum_split_stride = out_accum.stride(0);
@@ -1168,10 +1190,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
-            if (out_type == at::ScalarType::BFloat16) {
-                // Since we want output in BF16. Otherwise fwd_combine will output to FP16
-                params.is_bf16 = true;
-            }
+            params.is_fp32 = out_type == at::ScalarType::Float;
+            params.is_bf16 = out_type == at::ScalarType::BFloat16;
             // Unless there's seqused_q, for the purpose of attn_combine, we can just treat it as batch=1
             // and seqlen = total_q, and don't need to dispatch to Varlen there.
             // However, with dynamic split, each row needs to know which batch it belongs to
@@ -1286,7 +1306,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     int64_t window_size_right,
     double softcap,
     bool deterministic,
-    int64_t sm_margin
+    int64_t sm_margin,
+    std::optional<at::Tensor> learnable_sink_,
+    std::optional<at::Tensor> dsink_
 ) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1473,7 +1495,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
 
     auto opts = q.options();
     // Need softmax_d to have total_q_padded_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64
-    at::Tensor softmax_d, softmax_lse_log2;
+    at::Tensor softmax_d, dsink, softmax_lse_log2;
     if (!is_varlen) {
         // Need softmax_d to have seqlen_q_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64
         softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
@@ -1530,6 +1552,28 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
 
+    at::Tensor learnable_sink;
+    if (learnable_sink_.has_value()) {
+        learnable_sink = learnable_sink_.value().to(torch::kFloat32);
+        CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
+        TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
+        CHECK_SHAPE(learnable_sink, num_heads);
+        if (dsink_.has_value() && dsink_.value().dtype() == torch::kFloat32) {
+            dsink = dsink_.value();
+            CHECK_DEVICE(dsink); CHECK_CONTIGUOUS(dsink);
+            TORCH_CHECK(dsink.stride(-1) == 1, "dsink tensor must have contiguous last dimension");
+            CHECK_SHAPE(dsink, num_heads);
+        } else {
+            dsink = torch::empty_like(learnable_sink);
+        }
+        dsink.zero_();
+        params.learnable_sink_ptr = learnable_sink.data_ptr();
+        params.dsink_ptr = dsink.data_ptr();
+    } else {
+        params.learnable_sink_ptr = nullptr;
+        params.dsink_ptr = nullptr;
+    }
+
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     // Will be zero'ed out in the backward preprocess kernel
@@ -1562,6 +1606,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     } else if (total_q > 0 && num_heads_k > 0) {
         dq.zero_();
         softmax_d.zero_();
+    }
+
+    if (learnable_sink_.has_value()) {
+        if (dsink_.has_value() && dsink_.value().dtype() != torch::kFloat32) {
+            dsink = dsink.to(dsink_.value().dtype());
+            dsink_.value().copy_(dsink);
+        }
     }
 
     return { softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
@@ -1705,7 +1756,8 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? learnable_sink = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
@@ -1728,7 +1780,9 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int window_size_right = -1,"
         "float softcap = 0.0,"
         "bool deterministic = False,"
-        "int sm_margin = 0) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? learnable_sink = None,"
+        "Tensor? dsink = None) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"

@@ -89,6 +89,7 @@ def _flash_attn_forward(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
+    learnable_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -136,13 +137,14 @@ def _flash_attn_forward(
         num_splits,
         pack_gqa,
         sm_margin,
+        learnable_sink,
     )
 
     if out_accum is None:
-        out_accum = torch.tensor([], device=out.device)
+        out_accum = out.new_empty((0,), dtype=torch.float32)
 
     if softmax_lse_accum is None:
-        softmax_lse_accum = torch.tensor([], device=out.device)
+        softmax_lse_accum = out.new_empty((0,), dtype=torch.float32)
 
     return out, softmax_lse, out_accum, softmax_lse_accum
 
@@ -183,73 +185,230 @@ def _flash_attn_forward_fake(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
+    learnable_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Symbolic fake implementation of flash attention forward.
     Returns tensors with the correct shapes and dtypes without actual computation.
     """
+    if out_ is not None:
+        raise TypeError(
+            "Tracing (torch.compile/torch.export) with pre-allocated output tensor is not supported on "
+            "flash_attn_3::_flash_attn_forward. Use flash_attn_3::_flash_attn_forward_into instead."
+        )
 
-    # Determine if we're in varlen mode
+    return _flash_attn_forward_fake_outputs(
+        q=q,
+        v=v,
+        out_=None,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        num_splits=num_splits,
+    )
+
+
+# Keep preallocated-output semantics in a separate mutating op so tracing can
+# model "write into out" without returning an input alias from the functional op.
+@torch.library.custom_op("flash_attn_3::_flash_attn_forward_into", mutates_args=("out",), device_types="cuda")
+def _flash_attn_forward_into(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    k_new: Optional[torch.Tensor] = None,
+    v_new: Optional[torch.Tensor] = None,
+    qv: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    page_table: Optional[torch.Tensor] = None,
+    kv_batch_idx: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    seqlens_rotary: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    rotary_interleaved: bool = True,
+    scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+    learnable_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
+    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
+        maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new)
+    ]
+    seqused_q, seqused_k = [maybe_contiguous(x) for x in (seqused_q, seqused_k)]
+    page_table, kv_batch_idx, leftpad_k = [
+        maybe_contiguous(x) for x in (page_table, kv_batch_idx, leftpad_k)
+    ]
+    rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
+    seqlens_rotary = maybe_contiguous(seqlens_rotary)
+    _, softmax_lse, out_accum, softmax_lse_accum = flash_attn_3_gpu.fwd(
+        q,
+        k,
+        v,
+        k_new,
+        v_new,
+        qv,
+        out,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx,
+        leftpad_k,
+        rotary_cos,
+        rotary_sin,
+        seqlens_rotary,
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        attention_chunk,
+        softcap,
+        rotary_interleaved,
+        scheduler_metadata,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        learnable_sink,
+    )
+
+    if out_accum is None:
+        out_accum = out.new_empty((0,), dtype=torch.float32)
+
+    if softmax_lse_accum is None:
+        softmax_lse_accum = out.new_empty((0,), dtype=torch.float32)
+
+    return softmax_lse, out_accum, softmax_lse_accum
+
+
+def _flash_attn_forward_fake_outputs(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    out_: Optional[torch.Tensor],
+    cu_seqlens_q: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    num_splits: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     is_varlen_q = cu_seqlens_q is not None
 
-    # Get dimensions from query tensor
     if is_varlen_q:
-        # varlen mode: q is (total_q, num_heads, head_size)
-        total_q, num_heads, head_size = q.shape
+        total_q, num_heads, _ = q.shape
         batch_size = cu_seqlens_q.shape[0] - 1
-
         if max_seqlen_q is None:
             raise ValueError("max_seqlen_q must be provided if cu_seqlens_q is provided")
         seqlen_q = max_seqlen_q
     else:
-        # batch mode: q is (batch_size, seqlen_q, num_heads, head_size)
-        batch_size, seqlen_q, num_heads, head_size = q.shape
+        batch_size, seqlen_q, num_heads, _ = q.shape
         total_q = batch_size * q.shape[1]
-    # Get value head dimension
+
     head_size_v = v.shape[-1]
-
-    # Determine output dtype (FP8 inputs produce BF16 outputs)
-    q_type = q.dtype
-    if q_type == torch.float8_e4m3fn:
-        out_dtype = torch.bfloat16
+    if out_ is None:
+        out_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+        if is_varlen_q:
+            out = torch.empty((total_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
+        else:
+            out = torch.empty((batch_size, seqlen_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
     else:
-        out_dtype = q_type
-
-    # Create output tensor
-    if out_ is not None:
-        # If out_ is provided, _flash_attn_forward becomes non-functional
-        raise TypeError("Tracing (torch.compile/torch.export) with pre-allocated output tensor is not supported.")
+        out = out_
 
     if is_varlen_q:
-        out = torch.empty((total_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
+        softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=out.device)
     else:
-        out = torch.empty((batch_size, seqlen_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
+        softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=out.device)
 
-    # Create softmax_lse tensor
-    if is_varlen_q:
-        softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device)
-    else:
-        softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device)
-
-    # TODO(guilhermeleobas): Implement "get_num_splits"
-    # There's an heuristic to compute num_splits when "num_splits <= 0"
-    # assert that num_splits is > 0 for now
     if num_splits <= 0:
         raise ValueError(f"tracing (torch.compile/torch.export) with num_splits <= 0 not supported. Got {num_splits=}")
 
     if num_splits > 1:
         if is_varlen_q:
-            out_accum = torch.empty((num_splits, num_heads, total_q, head_size_v), dtype=torch.float32, device=q.device)
-            softmax_lse_accum = torch.empty((num_splits, num_heads, total_q), dtype=torch.float32, device=q.device)
+            out_accum = torch.empty((num_splits, num_heads, total_q, head_size_v), dtype=torch.float32, device=out.device)
+            softmax_lse_accum = torch.empty((num_splits, num_heads, total_q), dtype=torch.float32, device=out.device)
         else:
-            out_accum = torch.empty((num_splits, batch_size, num_heads, seqlen_q, head_size_v), dtype=torch.float32, device=q.device)
-            softmax_lse_accum = torch.empty((num_splits, batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device)
+            out_accum = torch.empty(
+                (num_splits, batch_size, num_heads, seqlen_q, head_size_v), dtype=torch.float32, device=out.device
+            )
+            softmax_lse_accum = torch.empty(
+                (num_splits, batch_size, num_heads, seqlen_q), dtype=torch.float32, device=out.device
+            )
     else:
-        # Tensors are not set when num_splits < 1
-        out_accum = torch.tensor([], device=out.device)
-        softmax_lse_accum = torch.tensor([], device=out.device)
+        out_accum = out.new_empty((0,), dtype=torch.float32)
+        softmax_lse_accum = out.new_empty((0,), dtype=torch.float32)
 
     return out, softmax_lse, out_accum, softmax_lse_accum
+
+
+
+@torch.library.register_fake("flash_attn_3::_flash_attn_forward_into")
+def _flash_attn_forward_into_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    k_new: Optional[torch.Tensor] = None,
+    v_new: Optional[torch.Tensor] = None,
+    qv: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    page_table: Optional[torch.Tensor] = None,
+    kv_batch_idx: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    seqlens_rotary: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    rotary_interleaved: bool = True,
+    scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+    learnable_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward_fake_outputs(
+        q=q,
+        v=v,
+        out_=out,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        num_splits=num_splits,
+    )
+    return softmax_lse, out_accum, softmax_lse_accum
 
 
 @torch.library.custom_op("flash_attn_3::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
@@ -276,6 +435,8 @@ def _flash_attn_backward(
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
+    learnable_sink: Optional[torch.Tensor] = None,
+    dsink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -302,6 +463,8 @@ def _flash_attn_backward(
         softcap,
         deterministic,
         sm_margin,
+        learnable_sink,
+        dsink,
     )
     return softmax_d
 
@@ -330,6 +493,8 @@ def _flash_attn_backward_fake(
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
+    learnable_sink: Optional[torch.Tensor] = None,
+    dsink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 
     is_varlen_q = cu_seqlens_q is not None
@@ -407,18 +572,20 @@ def _flash_attn_backward_fake(
 def setup_context(ctx, inputs, output):
     q, k, v = inputs[:3]
     out, softmax_lse, _, _ = output
-    ctx.save_for_backward(q, k, v, out, softmax_lse)
-    ctx.softmax_scale = inputs[-11]
-    ctx.causal = inputs[-10]
-    ctx.window_size = [inputs[-9], inputs[-8]]
-    ctx.attention_chunk = inputs[-7]
-    ctx.softcap = inputs[-6]
-    ctx.sm_margin = inputs[-1]
+    learnable_sink = inputs[-1]
+    ctx.save_for_backward(q, k, v, out, softmax_lse, learnable_sink)
+    ctx.softmax_scale = inputs[-12]
+    ctx.causal = inputs[-11]
+    ctx.window_size = [inputs[-10], inputs[-9]]
+    ctx.attention_chunk = inputs[-8]
+    ctx.softcap = inputs[-7]
+    ctx.sm_margin = inputs[-2]
 
 
 def _backward(ctx, dout, *grads):
-    q, k, v, out, softmax_lse = ctx.saved_tensors
+    q, k, v, out, softmax_lse, learnable_sink = ctx.saved_tensors
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    dsink = None if learnable_sink is None else torch.empty_like(learnable_sink)
     _flash_attn_backward(
         dout,
         q,
@@ -439,8 +606,10 @@ def _backward(ctx, dout, *grads):
         ctx.softcap,
         False, # deterministic
         ctx.sm_margin,
+        learnable_sink,
+        dsink,
     )
-    return dq, dk, dv, *((None,) * 21)
+    return dq, dk, dv, *((None,) * 21), dsink
 
 
 _flash_attn_forward.register_autograd(_backward, setup_context=setup_context)
@@ -462,6 +631,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         num_heads_q=None,
         sm_margin=0,
         return_softmax=False,
+        learnable_sink=None,
     ):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -496,7 +666,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             sm_margin=sm_margin,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, learnable_sink)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -509,7 +679,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
+        q, k, v, out, softmax_lse, learnable_sink = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         if ctx.ndim == 5:
             qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
@@ -521,6 +691,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             qkv_shape = q.shape[:-2] + (num_heads_q + num_heads_k * 2, *q.shape[-1:])
             dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
             dq, dk, dv = dqkv.split([num_heads_q, num_heads_k, num_heads_k], dim=-2)
+        dsink = None if learnable_sink is None else torch.empty_like(learnable_sink)
         _flash_attn_backward(
             dout,
             q,
@@ -541,9 +712,11 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            learnable_sink,
+            dsink,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None, None, None, None, None
+        return dqkv, None, None, None, None, None, None, None, None, None, None, None, None, dsink
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -566,6 +739,7 @@ class FlashAttnFunc(torch.autograd.Function):
         deterministic=False,
         sm_margin=0,
         return_softmax=False,
+        learnable_sink=None,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -592,9 +766,10 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
+            learnable_sink=learnable_sink,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, learnable_sink)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -606,9 +781,10 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
+        q, k, v, out, softmax_lse, learnable_sink = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        dsink = None if learnable_sink is None else torch.empty_like(learnable_sink)
         _flash_attn_backward(
             dout,
             q,
@@ -629,11 +805,13 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            learnable_sink,
+            dsink,
         )
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, dsink
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -662,6 +840,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic=False,
         sm_margin=0,
         return_softmax=False,
+        learnable_sink=None,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -692,9 +871,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
+            learnable_sink=learnable_sink,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
-        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
@@ -708,9 +888,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        dsink = None if learnable_sink is None else torch.empty_like(learnable_sink)
         _flash_attn_backward(
             dout,
             q,
@@ -734,11 +915,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            learnable_sink,
+            dsink,
         )
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, dsink
 
 
 def flash_attn_qkvpacked_func(
@@ -753,6 +936,7 @@ def flash_attn_qkvpacked_func(
     num_heads_q=None,
     sm_margin=0,
     return_attn_probs=False,
+    learnable_sink=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     If Q, K, V are already stacked into 1 tensor, this function will be faster than
@@ -800,6 +984,7 @@ def flash_attn_qkvpacked_func(
         num_heads_q,
         sm_margin,
         return_attn_probs,
+        learnable_sink,
     )
 
 
@@ -819,6 +1004,7 @@ def flash_attn_func(
     deterministic=False,
     sm_margin=0,
     return_attn_probs=False,
+    learnable_sink=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -881,6 +1067,7 @@ def flash_attn_func(
         deterministic,
         sm_margin,
         return_attn_probs,
+        learnable_sink,
     )
 
 
@@ -906,6 +1093,7 @@ def flash_attn_varlen_func(
     deterministic=False,
     sm_margin=0,
     return_attn_probs=False,
+    learnable_sink=None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -929,6 +1117,7 @@ def flash_attn_varlen_func(
         deterministic,
         sm_margin,
         return_attn_probs,
+        learnable_sink,
     )
 
 
@@ -967,6 +1156,7 @@ def flash_attn_with_kvcache(
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
+    learnable_sink=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -1095,6 +1285,7 @@ def flash_attn_with_kvcache(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
+        learnable_sink=learnable_sink,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out

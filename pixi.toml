@@ -1,0 +1,56 @@
+[workspace]
+name = "flash-attention-aoxy"
+version = "0.1.0"
+channels = [
+  "https://srgconda.bj.bcebos.com/",
+  "https://repo.prefix.dev/meta-forge",
+  "conda-forge",
+]
+platforms = ["linux-64"]
+
+[system-requirements]
+cuda = "12.9"
+
+[dependencies]
+python = "3.12.*"
+cuda = "12.9.*"
+pytorch = { version = "*", build = "*cuda*" }
+pip = "*"
+packaging = "*"
+setuptools = "*"
+wheel = "*"
+numpy = "*"
+c-compiler = "*"
+cxx-compiler = "*"
+cmake = "*"
+ninja = "*"
+cuda-toolkit = "12.9.*"
+
+[feature.dev.dependencies]
+pytest = "*"
+
+[environments]
+dev = { features = ["dev"], solve-group = "default" }
+
+[tasks]
+build-hopper = "python setup.py build_ext --inplace"
+
+[activation.env]
+PATH = "$CONDA_PREFIX/nvvm/bin:$CONDA_PREFIX/bin:$PATH"
+CUDA_HOME = "$CONDA_PREFIX"
+CPATH = "$CONDA_PREFIX/targets/x86_64-linux/include"
+CPLUS_INCLUDE_PATH = "$CONDA_PREFIX/targets/x86_64-linux/include"
+LIBRARY_PATH = "$CONDA_PREFIX/targets/x86_64-linux/lib"
+LD_LIBRARY_PATH = "$CONDA_PREFIX/targets/x86_64-linux/lib"
+CC = "$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-cc"
+CXX = "$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-c++"
+CMAKE_C_COMPILER = "$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-cc"
+CMAKE_CXX_COMPILER = "$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-c++"
+CUDAHOSTCXX = "$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-c++"
+CUDACXX = "$CONDA_PREFIX/bin/nvcc"
+CONDA_BUILD_SYSROOT = "$CONDA_PREFIX/x86_64-conda-linux-gnu/sysroot"
+MAX_JOBS = "16"
+NINJA_NUM_JOBS = "16"
+CMAKE_BUILD_PARALLEL_LEVEL = "16"
+NVCC_THREADS = "1"
+CUDA_PATH = "$CONDA_PREFIX"
