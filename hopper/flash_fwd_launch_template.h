@@ -199,24 +199,20 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     }
 }
 
-template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
-void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
-    static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
+template<int Arch, typename T, typename T_out, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
+void launch_mha_fwd_with_output_(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
-    using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
             VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
-                // Only needed here to decide if we should use cluster
-                static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap)) : 128;
+                static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(T), V_colmajor, PagedKVNonTMA, Has_softcap)) : 128;
                 static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKVNonTMA && !Varlen;
                 BOOL_SWITCH(params.qv_ptr, HasQV_, [&] {
                     static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_FP8 && kHeadDim == 64 && kHeadDimV >= 256;
                     APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
                         SINK_SWITCH(params.learnable_sink_ptr != nullptr, Has_sink, [&] {
                             static constexpr bool PackGQA_Sink = PackGQA && !Has_sink;
-                            // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                             CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA_Sink ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                                 static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
                                 run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA_Sink, Split, V_colmajor, Has_sink>(params, stream);
@@ -227,4 +223,18 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
             });
         });
     });
+}
+
+template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
+void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
+    static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
+    static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
+    static constexpr bool Is_BF16 = cute::is_same_v<T, cutlass::bfloat16_t>;
+    using DefaultTOut = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
+    if constexpr (Is_BF16) {
+        if (params.is_fp32) {
+            return launch_mha_fwd_with_output_<Arch, T, float, kHeadDim, kHeadDimV, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+        }
+    }
+    return launch_mha_fwd_with_output_<Arch, T, DefaultTOut, kHeadDim, kHeadDimV, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
 }
