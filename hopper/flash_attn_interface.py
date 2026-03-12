@@ -141,10 +141,10 @@ def _flash_attn_forward(
     )
 
     if out_accum is None:
-        out_accum = torch.tensor([], device=out.device)
+        out_accum = out.new_empty((0,), dtype=torch.float32)
 
     if softmax_lse_accum is None:
-        softmax_lse_accum = torch.tensor([], device=out.device)
+        softmax_lse_accum = out.new_empty((0,), dtype=torch.float32)
 
     return out, softmax_lse, out_accum, softmax_lse_accum
 
@@ -191,68 +191,224 @@ def _flash_attn_forward_fake(
     Symbolic fake implementation of flash attention forward.
     Returns tensors with the correct shapes and dtypes without actual computation.
     """
+    if out_ is not None:
+        raise TypeError(
+            "Tracing (torch.compile/torch.export) with pre-allocated output tensor is not supported on "
+            "flash_attn_3::_flash_attn_forward. Use flash_attn_3::_flash_attn_forward_into instead."
+        )
 
-    # Determine if we're in varlen mode
+    return _flash_attn_forward_fake_outputs(
+        q=q,
+        v=v,
+        out_=None,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        num_splits=num_splits,
+    )
+
+
+# Keep preallocated-output semantics in a separate mutating op so tracing can
+# model "write into out" without returning an input alias from the functional op.
+@torch.library.custom_op("flash_attn_3::_flash_attn_forward_into", mutates_args=("out",), device_types="cuda")
+def _flash_attn_forward_into(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    k_new: Optional[torch.Tensor] = None,
+    v_new: Optional[torch.Tensor] = None,
+    qv: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    page_table: Optional[torch.Tensor] = None,
+    kv_batch_idx: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    seqlens_rotary: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    rotary_interleaved: bool = True,
+    scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+    learnable_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
+    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
+        maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new)
+    ]
+    seqused_q, seqused_k = [maybe_contiguous(x) for x in (seqused_q, seqused_k)]
+    page_table, kv_batch_idx, leftpad_k = [
+        maybe_contiguous(x) for x in (page_table, kv_batch_idx, leftpad_k)
+    ]
+    rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
+    seqlens_rotary = maybe_contiguous(seqlens_rotary)
+    _, softmax_lse, out_accum, softmax_lse_accum = flash_attn_3_gpu.fwd(
+        q,
+        k,
+        v,
+        k_new,
+        v_new,
+        qv,
+        out,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx,
+        leftpad_k,
+        rotary_cos,
+        rotary_sin,
+        seqlens_rotary,
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        attention_chunk,
+        softcap,
+        rotary_interleaved,
+        scheduler_metadata,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        learnable_sink,
+    )
+
+    if out_accum is None:
+        out_accum = out.new_empty((0,), dtype=torch.float32)
+
+    if softmax_lse_accum is None:
+        softmax_lse_accum = out.new_empty((0,), dtype=torch.float32)
+
+    return softmax_lse, out_accum, softmax_lse_accum
+
+
+def _flash_attn_forward_fake_outputs(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    out_: Optional[torch.Tensor],
+    cu_seqlens_q: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    num_splits: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     is_varlen_q = cu_seqlens_q is not None
 
-    # Get dimensions from query tensor
     if is_varlen_q:
-        # varlen mode: q is (total_q, num_heads, head_size)
-        total_q, num_heads, head_size = q.shape
+        total_q, num_heads, _ = q.shape
         batch_size = cu_seqlens_q.shape[0] - 1
-
         if max_seqlen_q is None:
             raise ValueError("max_seqlen_q must be provided if cu_seqlens_q is provided")
         seqlen_q = max_seqlen_q
     else:
-        # batch mode: q is (batch_size, seqlen_q, num_heads, head_size)
-        batch_size, seqlen_q, num_heads, head_size = q.shape
+        batch_size, seqlen_q, num_heads, _ = q.shape
         total_q = batch_size * q.shape[1]
-    # Get value head dimension
+
     head_size_v = v.shape[-1]
-
-    # Determine output dtype (FP8 inputs produce BF16 outputs)
-    q_type = q.dtype
-    if q_type == torch.float8_e4m3fn:
-        out_dtype = torch.bfloat16
+    if out_ is None:
+        out_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+        if is_varlen_q:
+            out = torch.empty((total_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
+        else:
+            out = torch.empty((batch_size, seqlen_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
     else:
-        out_dtype = q_type
-
-    # Create output tensor
-    if out_ is not None:
-        # If out_ is provided, _flash_attn_forward becomes non-functional
-        raise TypeError("Tracing (torch.compile/torch.export) with pre-allocated output tensor is not supported.")
+        out = out_
 
     if is_varlen_q:
-        out = torch.empty((total_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
+        softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=out.device)
     else:
-        out = torch.empty((batch_size, seqlen_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
+        softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=out.device)
 
-    # Create softmax_lse tensor
-    if is_varlen_q:
-        softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device)
-    else:
-        softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device)
-
-    # TODO(guilhermeleobas): Implement "get_num_splits"
-    # There's an heuristic to compute num_splits when "num_splits <= 0"
-    # assert that num_splits is > 0 for now
     if num_splits <= 0:
         raise ValueError(f"tracing (torch.compile/torch.export) with num_splits <= 0 not supported. Got {num_splits=}")
 
     if num_splits > 1:
         if is_varlen_q:
-            out_accum = torch.empty((num_splits, num_heads, total_q, head_size_v), dtype=torch.float32, device=q.device)
-            softmax_lse_accum = torch.empty((num_splits, num_heads, total_q), dtype=torch.float32, device=q.device)
+            out_accum = torch.empty((num_splits, num_heads, total_q, head_size_v), dtype=torch.float32, device=out.device)
+            softmax_lse_accum = torch.empty((num_splits, num_heads, total_q), dtype=torch.float32, device=out.device)
         else:
-            out_accum = torch.empty((num_splits, batch_size, num_heads, seqlen_q, head_size_v), dtype=torch.float32, device=q.device)
-            softmax_lse_accum = torch.empty((num_splits, batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device)
+            out_accum = torch.empty(
+                (num_splits, batch_size, num_heads, seqlen_q, head_size_v), dtype=torch.float32, device=out.device
+            )
+            softmax_lse_accum = torch.empty(
+                (num_splits, batch_size, num_heads, seqlen_q), dtype=torch.float32, device=out.device
+            )
     else:
-        # Tensors are not set when num_splits < 1
-        out_accum = torch.tensor([], device=out.device)
-        softmax_lse_accum = torch.tensor([], device=out.device)
+        out_accum = out.new_empty((0,), dtype=torch.float32)
+        softmax_lse_accum = out.new_empty((0,), dtype=torch.float32)
 
     return out, softmax_lse, out_accum, softmax_lse_accum
+
+
+
+@torch.library.register_fake("flash_attn_3::_flash_attn_forward_into")
+def _flash_attn_forward_into_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    k_new: Optional[torch.Tensor] = None,
+    v_new: Optional[torch.Tensor] = None,
+    qv: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    page_table: Optional[torch.Tensor] = None,
+    kv_batch_idx: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    seqlens_rotary: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    rotary_interleaved: bool = True,
+    scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+    learnable_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward_fake_outputs(
+        q=q,
+        v=v,
+        out_=out,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        num_splits=num_splits,
+    )
+    return softmax_lse, out_accum, softmax_lse_accum
 
 
 @torch.library.custom_op("flash_attn_3::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")

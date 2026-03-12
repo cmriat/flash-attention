@@ -34,11 +34,11 @@ struct CollectiveEpilogueFwd {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool Use_smem = !(Split && !Varlen);
-    static constexpr bool Use_TMA_O = ArchTag::kMinComputeCapability >= 90 && !Varlen && !Split && !PackGQA;
+    static constexpr bool Use_TMA_O = ArchTag::kMinComputeCapability >= 90 && !Varlen && !Split && !PackGQA && sizeof(Element) <= 2;
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
     static_assert(ArchTag::kMinComputeCapability >= 90 || CUTE_STATIC_V(size(ClusterShape{})) == 1);
-    static_assert(sizeof(Element) <= 2);
+    static_assert(sizeof(Element) <= 4);
 
     static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
     static constexpr int kHeadDimV = get<1>(TileShape_MNK_PV{});
@@ -48,7 +48,7 @@ struct CollectiveEpilogueFwd {
     using GmemTiledCopyOTMA = cute::SM90_TMA_STORE;
 
     // These are for storing the output tensor without TMA (e.g., for setting output to zero)
-    static constexpr int kGmemElemsPerStore = sizeof(cute::uint128_t) / sizeof(Element);
+    static constexpr int kGmemElemsPerStore = kBlockM >= 32 ? sizeof(cute::uint128_t) / sizeof(Element) : sizeof(cute::uint64_t) / sizeof(Element);
     static_assert(kHeadDimV % kGmemElemsPerStore == 0, "Headdim must be a multiple of kGmemElemsPerStore");
     // We want each "row" to have 64 elements (128 bytes, i.e. 1 cache line). We want each thread to have 4 elements
     // in the M direction and 2 elements in the K direction. In the case of PackGQA, this reduces the number of times
@@ -57,23 +57,28 @@ struct CollectiveEpilogueFwd {
     static constexpr int kBlockKGmem = (kBytePerRow % 128 == 0 ? 128 : (kBytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerStore;
     // If PackGQA, we split the work of compute O_ptr among threads in the same row, so we need this to within a warp
-    static_assert(cutlass::NumThreadsPerWarp % kGmemThreadsPerRow == 0);
+    static_assert(!PackGQA || cutlass::NumThreadsPerWarp % kGmemThreadsPerRow == 0);
     static_assert(NumEpilogueThreads % kGmemThreadsPerRow == 0, "NumEpilogueThreads must be a multiple of kGmemThreadsPerRow");
     using GmemLayoutAtom = Layout<Shape <Int<NumEpilogueThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
     static_assert(kBlockM % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0, "kBlockM must be a multiple of NumEpilogueThreads / kGmemThreadsPerRow");
+    using GmemTileCopyAtomO = std::conditional_t<
+        kBlockM >= 32,
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>,
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<64>, Element>>;
     using GmemTiledCopyO = decltype(
-        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+        make_tiled_copy(GmemTileCopyAtomO{},
                         GmemLayoutAtom{},
-                        Layout<Shape<_1, Int<kGmemElemsPerStore>>>{}));  // Val layout, 8 or 16 vals per store
+                        Layout<Shape<_1, Int<kGmemElemsPerStore>>>{}));
 
     using SmemLayoutAtomOTMA = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK_PV{})), decltype(cute::get<1>(TileShape_MNK_PV{}))>());
     using SmemLayoutOTMA = decltype(tile_to_shape(SmemLayoutAtomOTMA{}, select<0, 1>(TileShape_MNK_PV{})));
-    static constexpr int kSwizzle = kBlockKGmem == 128 ? 4 : (kBlockKGmem == 64 ? 3 : (kBlockKGmem == 32 ? 2 : 1));
-    static constexpr int kSwizzleBase = sizeof(Element) == 4 ? 2 : (sizeof(Element) == 2 ? 3 : 4);
+    static constexpr int kSwizzle = sizeof(Element) == 4 ? 2 : (kBlockKGmem == 128 ? 4 : (kBlockKGmem == 64 ? 3 : (kBlockKGmem == 32 ? 2 : 1)));
+    static constexpr int kSwizzleBase = sizeof(Element) == 4 ? 3 : (sizeof(Element) == 2 ? 3 : 4);
+    static constexpr int kSwizzleShift = sizeof(Element) == 4 ? 2 : (sizeof(Element) == 2 ? 3 : 4);
     using SmemLayoutAtomO = decltype(
-        composition(Swizzle<kSwizzle, kSwizzleBase, kSwizzleBase>{},
+        composition(Swizzle<kSwizzle, kSwizzleBase, kSwizzleShift>{},
                     Layout<Shape<_8, Int<kBlockKGmem>>,
                            Stride<Int<kBlockKGmem>, _1>>{}));
     using SmemLayoutOSTS = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 1>(TileShape_MNK_PV{})));
@@ -238,8 +243,15 @@ struct CollectiveEpilogueFwd {
         // If we will possibly need tOrO in FP32, we'd want to permute tOrO before type conversion.
         // Otherwise we can permute after conversion.
         if constexpr (NeedFP8Permute && Split) { flash::permute_output_fp8_Vcolmajor(tOrO); }
-        Tensor tOrO_out = make_tensor_like<Element>(tOrO);
-        flash::convert_type_out(tOrO, tOrO_out);
+        auto tOrO_out = [&] {
+            if constexpr (cute::is_same_v<Element, float>) {
+                return tOrO;
+            } else {
+                Tensor out = make_tensor_like<Element>(tOrO);
+                flash::convert_type_out(tOrO, out);
+                return out;
+            }
+        }();
         if constexpr (NeedFP8Permute && !Split) { flash::permute_output_fp8_Vcolmajor(tOrO_out); }
 
         // Make sure all WGs have finished reading V

@@ -705,7 +705,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
         int64_t sm_margin,
-        std::optional<const at::Tensor> learnable_sink_
+        std::optional<at::Tensor> learnable_sink_
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -857,11 +857,19 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
     auto opts = q.options();
-    auto out_type = q_type == at::ScalarType::Float8_e4m3fn ? at::ScalarType::BFloat16 : q_type;
+    auto default_out_type = q_type == at::ScalarType::Float8_e4m3fn ? at::ScalarType::BFloat16 : q_type;
+    auto out_type = out_.has_value() ? out_.value().scalar_type() : default_out_type;
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.scalar_type() == out_type, "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
+        if (q_type == at::ScalarType::BFloat16) {
+            TORCH_CHECK(
+                out_type == at::ScalarType::BFloat16 || out_type == at::ScalarType::Float,
+                "For BF16 input, output must have dtype BF16 or FP32"
+            );
+        } else {
+            TORCH_CHECK(out_type == default_out_type, "Output tensor must match the selected output dtype");
+        }
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         if (!is_varlen_q) {
@@ -912,6 +920,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
                      attention_chunk,
                      softcap,
                      sm_margin);
+    params.is_fp32 = out_type == at::ScalarType::Float;
     params.total_q = total_q;
     params.total_k = total_k;
     params.b_k = batch_size_k;
@@ -1115,7 +1124,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             out_accum = torch::empty({params.num_splits, num_heads, total_q, head_size_v}, opts.dtype(outaccum_type));
             softmax_lse_accum = torch::empty({params.num_splits, num_heads, total_q}, opts.dtype(at::kFloat));
         }
-        params.is_fp32 = false;
+        params.is_fp32 = out_type == at::ScalarType::Float;
         params.oaccum_ptr = out_accum.data_ptr();
         params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
         params.oaccum_split_stride = out_accum.stride(0);
@@ -1181,10 +1190,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
-            if (out_type == at::ScalarType::BFloat16) {
-                // Since we want output in BF16. Otherwise fwd_combine will output to FP16
-                params.is_bf16 = true;
-            }
+            params.is_fp32 = out_type == at::ScalarType::Float;
+            params.is_bf16 = out_type == at::ScalarType::BFloat16;
             // Unless there's seqused_q, for the purpose of attn_combine, we can just treat it as batch=1
             // and seqlen = total_q, and don't need to dispatch to Varlen there.
             // However, with dynamic split, each row needs to know which batch it belongs to
@@ -1300,7 +1307,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     double softcap,
     bool deterministic,
     int64_t sm_margin,
-    std::optional<const at::Tensor> learnable_sink_,
+    std::optional<at::Tensor> learnable_sink_,
     std::optional<at::Tensor> dsink_
 ) {
 
@@ -1749,7 +1756,8 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? learnable_sink = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
@@ -1772,7 +1780,9 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int window_size_right = -1,"
         "float softcap = 0.0,"
         "bool deterministic = False,"
-        "int sm_margin = 0) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? learnable_sink = None,"
+        "Tensor? dsink = None) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"
