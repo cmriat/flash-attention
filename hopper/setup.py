@@ -593,6 +593,10 @@ if not SKIP_CUDA_BUILD:
         + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90
         + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90
     )
+    sources += [
+        "instantiations/flash_fwd_arbitrary_nfunc3_hdim64_bf16_sm90.cu",
+        "instantiations/flash_fwd_arbitrary_nfunc3_hdim256_bf16_sm90.cu",
+    ]
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]
     sources += ["flash_prepare_scheduler.cu"]

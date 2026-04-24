@@ -1,6 +1,6 @@
 # Copyright (c) 2023, Tri Dao.
 
-from typing import Optional, Union, List, Tuple
+from typing import Optional, Union, List, Tuple, NamedTuple
 
 import os
 import sys
@@ -24,8 +24,42 @@ else:
 
     flash_attn_3_gpu = torch.ops.flash_attn_3
 
+
+class LinearBlockSparseTensors(NamedTuple):
+    mask_block_cnt: torch.Tensor
+    mask_block_offset: torch.Tensor
+    mask_block_idx: torch.Tensor
+    full_block_cnt: Optional[torch.Tensor] = None
+    full_block_offset: Optional[torch.Tensor] = None
+    full_block_idx: Optional[torch.Tensor] = None
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _unpack_block_sparse(
+    block_sparse: Optional[LinearBlockSparseTensors],
+    *,
+    name: str,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if block_sparse is None:
+        return (None, None, None, None, None, None)
+    if hasattr(block_sparse, "mask_block_cnt"):
+        tensors = (
+            block_sparse.mask_block_cnt,
+            block_sparse.mask_block_offset,
+            block_sparse.mask_block_idx,
+            block_sparse.full_block_cnt,
+            block_sparse.full_block_offset,
+            block_sparse.full_block_idx,
+        )
+    else:
+        tensors = tuple(block_sparse)
+        if len(tensors) != 6:
+            raise ValueError(f"{name} must provide 6 tensors, got {len(tensors)}")
+    if any(t is None for t in tensors):
+        raise ValueError(f"{name} requires all 6 tensors for the current Hopper arbitrary-mask port")
+    return tuple(maybe_contiguous(t) for t in tensors)
 
 
 def round_multiple(x, m):
@@ -924,6 +958,97 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, dsink
 
 
+class FlashAttnVarlenArbitraryFunc(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+        qv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        window_size=(-1, -1),
+        attention_chunk=0,
+        softcap=0.0,
+        num_splits=1,
+        pack_gqa=None,
+        deterministic=False,
+        sm_margin=0,
+        return_softmax=False,
+        learnable_sink=None,
+        arbitrary_func=None,
+        q2k_block_sparse=None,
+        k2q_block_sparse=None,
+    ):
+        del ctx, deterministic, k2q_block_sparse
+        if softmax_scale is None:
+            softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
+        q, k = [maybe_contiguous(x) for x in (q, k)]
+        v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+        cu_seqlens_q, cu_seqlens_k = [maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k)]
+        seqused_q, seqused_k = [maybe_contiguous(x) for x in (seqused_q, seqused_k)]
+        q2k_tensors = _unpack_block_sparse(q2k_block_sparse, name="q2k_block_sparse")
+        out, softmax_lse, *_ = flash_attn_3_gpu.fwd(
+            q,
+            k,
+            v,
+            None,
+            None,
+            qv,
+            None,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            None,
+            seqused_q,
+            seqused_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            q_descale,
+            k_descale,
+            v_descale,
+            softmax_scale,
+            causal,
+            window_size[0],
+            window_size[1],
+            attention_chunk,
+            softcap,
+            True,
+            None,
+            num_splits,
+            pack_gqa,
+            sm_margin,
+            learnable_sink,
+            *q2k_tensors,
+            arbitrary_func,
+        )
+        return (out, softmax_lse) if return_softmax else out
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        del ctx, grad_outputs
+        raise NotImplementedError(
+            "Arbitrary-mask backward has not been ported to flash-attention/main yet. "
+            "This main-branch Hopper port is forward-only for now."
+        )
+
+
 def flash_attn_qkvpacked_func(
     qkv,
     softmax_scale=None,
@@ -1005,6 +1130,9 @@ def flash_attn_func(
     sm_margin=0,
     return_attn_probs=False,
     learnable_sink=None,
+    arbitrary_func=None,
+    q2k_block_sparse=None,
+    k2q_block_sparse=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1051,6 +1179,12 @@ def flash_attn_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    if arbitrary_func is not None or q2k_block_sparse is not None or k2q_block_sparse is not None:
+        raise NotImplementedError(
+            "The flash-attention/main arbitrary-mask port currently supports varlen forward only. "
+            "Use flash_attn_varlen_func for Gemma arbitrary-mask inputs."
+        )
+
     return FlashAttnFunc.apply(
         q,
         k,
@@ -1094,7 +1228,41 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_attn_probs=False,
     learnable_sink=None,
+    arbitrary_func=None,
+    q2k_block_sparse=None,
+    k2q_block_sparse=None,
 ):
+    if arbitrary_func is not None or q2k_block_sparse is not None or k2q_block_sparse is not None:
+        return FlashAttnVarlenArbitraryFunc.apply(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
+            causal,
+            qv,
+            q_descale,
+            k_descale,
+            v_descale,
+            window_size,
+            attention_chunk,
+            softcap,
+            num_splits,
+            pack_gqa,
+            deterministic,
+            sm_margin,
+            return_attn_probs,
+            learnable_sink,
+            arbitrary_func,
+            q2k_block_sparse,
+            k2q_block_sparse,
+        )
+
     return FlashAttnVarlenFunc.apply(
         q,
         k,
