@@ -203,6 +203,25 @@
     }                                                                                            \
   }()
 
+
+#ifdef FLASHATTENTION_DISABLE_ARBITRARY
+  #define NFUNC_SWITCH(IS_ARBITRARY, NFUNC_VALUE, CONST_NAME, ...)                               \
+  [&] {                                                                                          \
+    constexpr static int CONST_NAME = 0;                                                         \
+    return __VA_ARGS__();                                                                        \
+  }()
+#else
+  #define NFUNC_SWITCH(IS_ARBITRARY, NFUNC_VALUE, CONST_NAME, ...)                               \
+  [&] {                                                                                          \
+    if (!(IS_ARBITRARY)) {                                                                       \
+      constexpr static int CONST_NAME = 0;                                                       \
+      return __VA_ARGS__();                                                                      \
+    }                                                                                            \
+    constexpr static int CONST_NAME = 3;                                                         \
+    return __VA_ARGS__();                                                                        \
+  }()
+#endif
+
 #ifdef FLASHATTENTION_DISABLE_SINK
   #define SINK_SWITCH(COND, CONST_NAME, ...)   \
   [&] {                                         \

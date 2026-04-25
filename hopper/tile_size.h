@@ -77,3 +77,60 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm8x(
         return {128, 64, 8, 2, false};
     }
 }
+
+
+// Return {kBlockM, kBlockN, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
+//         NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs}
+constexpr std::tuple<int, int, int, int, bool, bool, bool, int, int, int, int, bool>
+tile_size_bwd_sm90(int headdim, bool is_causal, bool is_local, bool is_arbitrary, bool has_softcap) {
+    if (headdim <= 64) {
+        int kBlockM = ((is_causal && has_softcap) || is_arbitrary) ? 96 : 128;
+        bool dQ_swapAB = kBlockM < 128;
+        return {kBlockM, 128, 2, 2, true, false, dQ_swapAB, 2, 1, 2, 2, false};
+    } else if (headdim <= 96) {
+        return {64, 128, 2, 2, true, false, false, 2, 1, 2, 1, true};
+    } else if (headdim <= 128) {
+        int kBlockM = (is_causal || is_local || has_softcap || is_arbitrary) ? 64 : 80;
+        bool dQ_swapAB = kBlockM == 80;
+        return {kBlockM, 128, 2, 2, true, false, dQ_swapAB, 2, 1, 2, 1, false};
+    } else if (headdim <= 192) {
+        return {64, 96, 1, 1, false, true, false, 3, 1, 1, 1, false};
+    } else {
+        return {64, 80, 1, 1, false, true, true, 2, 1, 1, 1, false};
+    }
+}
+
+// Return {kBlockM, kBlockN, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
+//         NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs}
+constexpr std::tuple<int, int, int, int, bool, bool, bool, int, int, int, int, bool>
+tile_size_bwd_sm8x(bool sm86_or_89, int headdim, bool is_causal, bool is_local, bool is_arbitrary, bool has_softcap) {
+    (void)is_causal;
+    (void)is_local;
+    (void)is_arbitrary;
+    (void)has_softcap;
+    if (sm86_or_89) {
+        if (headdim <= 64) {
+            return {64, 128, 2, 2, false, false, false, 2, 2, 4, 2, true};
+        } else if (headdim <= 96) {
+            return {64, 128, 1, 2, false, false, false, 2, 2, 4, 2, true};
+        } else if (headdim <= 128) {
+            return {64, 96, 1, 2, false, false, false, 2, 2, 2, 2, true};
+        } else if (headdim <= 192) {
+            return {64, 64, 1, 1, false, false, false, 2, 2, 2, 2, true};
+        } else {
+            return {32, 64, 1, 1, false, false, false, 2, 2, 2, 1, true};
+        }
+    } else {
+        if (headdim <= 64) {
+            return {128, 128, 2, 2, false, false, false, 2, 4, 4, 4, false};
+        } else if (headdim <= 96) {
+            return {64, 128, 2, 2, false, false, false, 2, 2, 4, 2, false};
+        } else if (headdim <= 128) {
+            return {64, 128, 2, 2, false, false, false, 2, 2, 2, 2, false};
+        } else if (headdim <= 192) {
+            return {64, 80, 1, 2, false, true, false, 2, 4, 2, 2, false};
+        } else {
+            return {64, 64, 1, 1, false, false, false, 2, 4, 2, 2, false};
+        }
+    }
+}
