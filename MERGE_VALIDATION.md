@@ -13,8 +13,8 @@ installed in the `attention-core` pixi environment.
   - build tag: `*cmriat_main_403feae*`
 - Local merged tree:
   - repo: `/home/jovyan/dev/gemma4/flash-attention`
-  - branch: `main`
-  - base commit during validation: `e7abacd`
+  - branch: `feat/fa3-arbitrary-merge-finalize`
+  - validated fix commit: `c6ec034`
 
 ## Benchmark Method
 
