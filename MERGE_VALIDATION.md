@@ -20,14 +20,14 @@ installed in the `attention-core` pixi environment.
 
 - Benchmark harness: `attention-core` existing benchmark configs
 - Environment: `pixi run -m /home/jovyan/dev/gemma4/attention-core -e dev`
-- Timing mode:
-  - reuse the existing benchmark configs and input shapes
-  - disable `profile` and `dump_memory`
-  - reason: `fwd_ms` / `fwd_bwd_ms` are measured before profiler trace merge, so
-    profiling only adds long post-processing time and can hide kernel timing
 - Local FA override:
-  - `PYTHONPATH=/home/jovyan/dev/gemma4/attention-core:/home/jovyan/dev/gemma4/flash-attention/hopper`
-  - `ATTENTION_CORE_FA3_HOPPER_DIR=/home/jovyan/dev/gemma4/flash-attention/hopper`
+  - `PYTHONPATH=/home/jovyan/dev/gemma4/flash-attention/hopper`
+- Note:
+  - the standard varlen regression was reproduced both through the benchmark
+    harness and through a direct `flash_attn_varlen_func` forward+backward smoke
+    test
+  - the fix was validated first on direct `D=96/192` varlen backward, then on
+    the original `example_varlen_core.py` benchmark config
 
 ## Results
 
@@ -65,23 +65,38 @@ Shape:
 
 Installed package full-config row:
 
-| Variant | fwd_ms | fwd_bwd_ms |
-| --- | ---: | ---: |
-| installed `403feae` | `2.2998` | `11.7608` |
+| Variant | fwd_ms | fwd_bwd_ms | Delta fwd | Delta fwd_bwd |
+| --- | ---: | ---: | ---: | ---: |
+| installed `403feae` | `2.2998` | `11.7608` | `-` | `-` |
+| local merged (fixed) | `2.2990` | `11.3059` | `-0.03%` | `-3.87%` |
 
-Isolated `varlen_fa3` only, same shape, reduced timing loop (`warmup=2`, `iters=5`):
+Root cause and fix:
 
-| Variant | status |
-| --- | --- |
-| installed `403feae` | `fwd_ms=2.1509`, `fwd_bwd_ms=11.2430` |
-| local merged | `timeout after 80s wall clock` |
+- The regression was not in the attention-core wrapper.
+- Direct local Hopper repro showed:
+  - forward for `D=96/192` finished normally
+  - backward for `D=96/192` stalled on the merged tree
+- The working baseline at `403feae` used explicit SM90 backward dispatch bodies
+  for `hdim96` and `hdim192`.
+- The merged tree had moved those paths onto the unified `run_mha_bwd_<...>`
+  launcher; restoring the old explicit dispatch bodies for `hdim96/192`
+  removed the stall immediately.
+
+Validation after fix:
+
+- Direct smoke:
+  - `D=96, S=512`: `1.2690s`
+  - `D=96, S=2048`: `1.1616s`
+  - `D=192, S=2048`: `0.0175s`
+- Benchmark:
+  - `example_varlen_core.py` now completes normally
+  - `varlen_fa3`: `fwd_ms=2.2990`, `fwd_bwd_ms=11.3059`
 
 Conclusion:
 
-- Local merged `varlen_fa3` has a performance or liveness regression on the
-  standard varlen benchmark path.
-- This is not a profiler artifact. The timeout was reproduced with profiler and
-  memory dump disabled.
+- Standard varlen FA3 benchmark is no longer blocked.
+- After restoring the `hdim96/192` SM90 backward dispatch, local merged
+  performance is back in family with the installed `403feae` package.
 
 ### 3. Sink Paths
 
@@ -127,7 +142,8 @@ Known remaining issue:
 ## Overall Status
 
 - Dense FA3: acceptable
+- Standard varlen FA3: acceptable after restoring `hdim96/192` backward dispatch
 - Sink paths: acceptable
 - Arbitrary-mask precision path: restored to expected baseline
-- Standard varlen FA3 benchmark path: blocked by a local merged regression /
-  hang and must be fixed before treating the merge as performance-clean
+- Remaining open item:
+  - `attention-core` 8-GPU Gemma AMFA strict fp32-reference end-to-end metrics

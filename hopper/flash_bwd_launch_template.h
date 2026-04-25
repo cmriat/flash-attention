@@ -397,7 +397,21 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
 
 template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
-    run_mha_bwd_<Arch, T, 96, Has_softcap, 0>(params, stream);
+    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
+        if constexpr (Arch >= 90) {
+            run_mha_bwd_dispatch<Arch, T, 64, 128, 96, Is_causal, Is_local, Has_softcap,
+                                 2, 2, true, false, false, 2, 1, 2, 1, true,
+                                 false, 0>(params, stream);
+        } else if constexpr (Arch == 86 || Arch == 89) {
+            run_mha_bwd_dispatch<Arch, T, 64, 128, 96, Is_causal, Is_local, Has_softcap,
+                                 1, 2, false, false, false, 2, 2, 4, 2, true,
+                                 false, 0>(params, stream);
+        } else {
+            run_mha_bwd_dispatch<Arch, T, 64, 128, 96, Is_causal, Is_local, Has_softcap,
+                                 2, 2, false, false, false, 2, 2, 4, 2, false,
+                                 false, 0>(params, stream);
+        }
+    });
 }
 
 template<int Arch, typename T, bool Has_softcap>
@@ -407,7 +421,21 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
 
 template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
-    run_mha_bwd_<Arch, T, 192, Has_softcap, 0>(params, stream);
+    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
+        if constexpr (Arch >= 90) {
+            run_mha_bwd_dispatch<Arch, T, 64, 96, 192, Is_causal, Is_local, Has_softcap,
+                                 1, 1, false, true, false, 3, 1, 1, 1, false,
+                                 false, 0>(params, stream);
+        } else if constexpr (Arch == 86 || Arch == 89) {
+            run_mha_bwd_dispatch<Arch, T, 64, 64, 192, Is_causal, Is_local, Has_softcap,
+                                 1, 1, false, false, false, 2, 2, 2, 2, true,
+                                 false, 0>(params, stream);
+        } else {
+            run_mha_bwd_dispatch<Arch, T, 64, 80, 192, Is_causal, Is_local, Has_softcap,
+                                 1, 2, false, true, false, 2, 4, 2, 2, false,
+                                 false, 0>(params, stream);
+        }
+    });
 }
 
 template<int Arch, typename T, bool Has_softcap>
