@@ -89,7 +89,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         Arch >= 90,
         flash::CollectiveMainloopBwdSm90<Stages, Stages_dO, Stages_dS, ClusterShape, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm90,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
-            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Is_arbitrary, kNFunc>,
+            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Is_arbitrary, kNFunc, Has_sink>,
         flash::CollectiveMainloopBwdSm80<Stages, Stages_dO, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm80,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
             SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Is_arbitrary, kNFunc>
@@ -138,6 +138,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.dq_semaphore,
         params.cu_seqlens_q, params.cu_seqlens_k,
         params.seqused_q, params.seqused_k,
+        reinterpret_cast<float const*>(params.learnable_sink_ptr),
         // Block sparsity arguments (K2Q direction for backward)
         {params.block_sparse_mask_cnt, params.block_sparse_mask_offset, params.block_sparse_mask_idx,
          params.block_sparse_full_cnt, params.block_sparse_full_offset, params.block_sparse_full_idx,
@@ -387,4 +388,29 @@ void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream) {
                 V_in_regs, Is_arbitrary, kNFunc>(params, stream);
         });
     }
+}
+
+template<int Arch, typename T, bool Has_softcap>
+void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
+    run_mha_bwd_<Arch, T, 64, Has_softcap, 0>(params, stream);
+}
+
+template<int Arch, typename T, bool Has_softcap>
+void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
+    run_mha_bwd_<Arch, T, 96, Has_softcap, 0>(params, stream);
+}
+
+template<int Arch, typename T, bool Has_softcap>
+void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
+    run_mha_bwd_<Arch, T, 128, Has_softcap, 0>(params, stream);
+}
+
+template<int Arch, typename T, bool Has_softcap>
+void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
+    run_mha_bwd_<Arch, T, 192, Has_softcap, 0>(params, stream);
+}
+
+template<int Arch, typename T, bool Has_softcap>
+void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
+    run_mha_bwd_<Arch, T, 256, Has_softcap, 0>(params, stream);
 }

@@ -262,9 +262,11 @@ public:
                 int const row = get<0>(tOcO(_0{}, mi, _0{}));
                 bool const row_is_valid = row < seqlen_o - m_block * kBlockM;
                 gdPsum(row) = row_is_valid ? dP_sum(mi) : 0;
-                if (row_is_valid && params.ptr_Sink != nullptr && params.ptr_dSink != nullptr) {
-                    float const sink_prob = expf(params.ptr_Sink[bidh] - gLSE(row));
-                    atomicAdd(params.ptr_dSink + bidh, -sink_prob * dP_sum(mi));
+                if constexpr (ArchTag::kMinComputeCapability < 90) {
+                    if (row_is_valid && params.ptr_Sink != nullptr && params.ptr_dSink != nullptr) {
+                        float const sink_prob = expf(params.ptr_Sink[bidh] - gLSE(row));
+                        atomicAdd(params.ptr_dSink + bidh, -sink_prob * dP_sum(mi));
+                    }
                 }
             }
         }

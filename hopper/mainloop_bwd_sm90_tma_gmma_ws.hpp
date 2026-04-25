@@ -32,7 +32,7 @@ template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class T
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
         int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-        bool Mma_dP_is_RS=false, bool Is_arbitrary_=false, int kNFunc_=1>
+        bool Mma_dP_is_RS=false, bool Is_arbitrary_=false, int kNFunc_=1, bool Has_sink_=false>
 struct CollectiveMainloopBwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -53,6 +53,7 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr bool Is_arbitrary = Is_arbitrary_;
     static constexpr bool Use_block_sparsity = Is_arbitrary_;
     static constexpr int kNFunc = kNFunc_;
+    static constexpr bool Has_sink = Has_sink_;
 
     static constexpr bool SdP_swapAB = SdP_swapAB_;
     static constexpr bool dKV_swapAB = dKV_swapAB_;
@@ -327,6 +328,7 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        float const* const ptr_Sink = nullptr;
         // Block sparsity arguments (K2Q direction for backward)
         BlockSparsityArguments block_sparse{};
         // Arbitrary mask function parameters
@@ -363,6 +365,7 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        float const* const ptr_Sink = nullptr;
         // Block sparsity params (K2Q direction for backward)
         BlockSparsityParams block_sparse{};
         // Arbitrary mask function parameters
@@ -425,7 +428,7 @@ struct CollectiveMainloopBwdSm90 {
                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
+                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k, args.ptr_Sink,
                 // Block sparsity params - convert from Arguments to Params (same structure)
                 {args.block_sparse.mask_block_cnt, args.block_sparse.mask_block_offset, args.block_sparse.mask_block_idx,
                  args.block_sparse.full_block_cnt, args.block_sparse.full_block_offset, args.block_sparse.full_block_idx,
@@ -815,6 +818,7 @@ struct CollectiveMainloopBwdSm90 {
         int &work_idx,
         cute::tuple<int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage,
+        float &dsink_val,
         BlockSparsityParams const& block_sparse_params = {}
         ) {
         static_assert(is_rmem<FrgTensordKV>::value, "dK and dV tensor must be rmem resident.");
@@ -927,6 +931,8 @@ struct CollectiveMainloopBwdSm90 {
 
         int const seqlen_q = seqlen_info.seqlen_q;
         int const seqlen_k = seqlen_info.seqlen_k;
+        dsink_val = 0.0f;
+        float const sink_val = !Has_sink ? -INFINITY : reinterpret_cast<float const*>(params.ptr_Sink)[bidh];
 
         // For the case where we do atomicAdd directly to gdQaccum instead of using TMA
         bool const is_varlen = Varlen && params.cu_seqlens_q;
@@ -1014,14 +1020,23 @@ struct CollectiveMainloopBwdSm90 {
             Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
             #pragma unroll
             for (int mi = 0; mi < size<0>(dS); ++mi) {
+                float dsink_val_cols = 0.0f;
                 float const dP_sum_cur = [&] {
                     if constexpr (!ShuffledPsum) return tLSErdPsum(mi);
                     else return __shfl_sync(0xffffffff, tLSErdPsum(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
                 }();
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(dS); ++ni) {
+                    if constexpr (Has_sink) { dsink_val_cols += scores(mi, ni) * dS(mi, ni); }
                     dS(mi, ni) = scores(mi, ni) * (dS(mi, ni) - dP_sum_cur);
                     if constexpr (Has_softcap) { dS(mi, ni) *= dtanh(mi, ni); }
+                }
+                if constexpr (Has_sink) {
+                    float const lse_scaled = [&] {
+                        if constexpr (!ShuffleLSE) return tLSErLSE(mi);
+                        else return __shfl_sync(0xffffffff, tLSErLSE(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
+                    }();
+                    dsink_val += dsink_val_cols * exp2f(sink_val * float(M_LOG2E) - lse_scaled);
                 }
             }
 
