@@ -598,6 +598,8 @@ if not SKIP_CUDA_BUILD:
         "instantiations/flash_fwd_arbitrary_nfunc3_hdim64_bf16_sm90.cu",
         "instantiations/flash_fwd_arbitrary_nfunc3_hdim256_bf16_sm90.cu",
     ]
+    if not DISABLE_BACKWARD:
+        sources += ["instantiations/flash_bwd_nfunc3_sm90.cu"]
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]
     sources += ["flash_prepare_scheduler.cu"]

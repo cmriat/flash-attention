@@ -1405,6 +1405,20 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 #else
 template <int Arch, bool Has_softcap, int kNFunc>
 void run_mha_bwd_constexpr(Flash_bwd_params &params, cudaStream_t stream) {
+    if constexpr (kNFunc == 3) {
+        TORCH_CHECK(!Has_softcap, "Arbitrary-mask backward does not support softcap.");
+        TORCH_CHECK(params.is_bf16, "Arbitrary-mask backward only supports bf16.");
+        #ifndef FLASHATTENTION_DISABLE_HDIM64
+        if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, false, 3>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM256
+        if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, false, 3>(params, stream); }
+        #endif
+        TORCH_CHECK(
+            false,
+            "Arbitrary-mask backward only supports bf16 with head_dim 64 or 256."
+        );
+    }
     if (!params.is_bf16) {
         #ifndef FLASHATTENTION_DISABLE_FP16
         #ifndef FLASHATTENTION_DISABLE_HDIM64
