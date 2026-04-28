@@ -1344,7 +1344,8 @@ struct CollectiveMainloopFwdSm90Arbitrary {
                 auto arbitrary_mask_fn = [&](auto& tSrS, int n_block) {
                     if constexpr (Is_arbitrary) {
                         auto gMaskFunc = construct_gMaskFunc();
-                        mask.template apply<false /*Seqlenk_mask*/, false, false, Is_arbitrary, kNFunc>(tSrS, m_block, n_block, &gMaskFunc);
+                        mask.template apply<false /*Seqlenk_mask*/, false, false, Is_arbitrary, kNFunc>(
+                            tSrS, m_block, n_block, &gMaskFunc, int(get<1>(params.shape_mask_func)));
                     }
                     // No mask needed if Is_arbitrary is false (full block behavior)
                 };
@@ -1503,7 +1504,8 @@ struct CollectiveMainloopFwdSm90Arbitrary {
                 auto arbitrary_mask_fn = [&](auto& tSrS, int n_block) {
                     if constexpr (Is_arbitrary) {
                         auto gMaskFunc = construct_gMaskFunc();
-                        mask.template apply<false /*Seqlenk_mask*/, false, false, Is_arbitrary, kNFunc>(tSrS, m_block, n_block, &gMaskFunc);
+                        mask.template apply<false /*Seqlenk_mask*/, false, false, Is_arbitrary, kNFunc>(
+                            tSrS, m_block, n_block, &gMaskFunc, int(get<1>(params.shape_mask_func)));
                     }
                     // No mask needed if Is_arbitrary is false (full block behavior)
                 };

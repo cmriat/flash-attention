@@ -395,9 +395,10 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // });
     TORCH_CHECK(params.num_splits >= 1);
     if (params.is_arbitrary) {
-        TORCH_CHECK(params.arbitrary_func_num == 3, "Arbitrary-mask forward currently supports func_num=3 only.");
         ARCH_SWITCH(params.arch, Arch, [&] {
-            run_mha_fwd_arbitrary_constexpr<Arch, 3>(params, stream);
+            NFUNC_SWITCH(params.is_arbitrary, params.arbitrary_func_num, kNFunc, [&] {
+                run_mha_fwd_arbitrary_constexpr<Arch, kNFunc>(params, stream);
+            });
         });
         return;
     }
@@ -1060,7 +1061,11 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         CHECK_DEVICE(arbitrary_func); CHECK_CONTIGUOUS(arbitrary_func);
         TORCH_CHECK(arbitrary_func.dtype() == torch::kInt32, "arbitrary_func must have dtype int32");
         TORCH_CHECK(arbitrary_func.dim() == 4, "arbitrary_func must be 4D [batch, head_q, func_num, seqlen_q+256]");
-        TORCH_CHECK(arbitrary_func.size(2) == 3, "arbitrary_func func_num must be 3 for the current Hopper arbitrary-mask port.");
+        TORCH_CHECK(arbitrary_func.size(2) % 2 == 1,
+                    "arbitrary_func func_num must be odd. Got ", arbitrary_func.size(2));
+        TORCH_CHECK(arbitrary_func.size(2) <= FLASHATTENTION_MAX_NUM_FUNC,
+                    "arbitrary_func func_num must be <= FLASHATTENTION_MAX_NUM_FUNC (",
+                    FLASHATTENTION_MAX_NUM_FUNC, "). Got ", arbitrary_func.size(2));
         TORCH_CHECK(arbitrary_func.size(3) >= seqlen_q + 256,
                     "arbitrary_func seqlen_q dimension must be >= seqlen_q + 256. Got ",
                     arbitrary_func.size(3), ", expected >= ", seqlen_q + 256);
@@ -1405,14 +1410,14 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 #else
 template <int Arch, bool Has_softcap, int kNFunc>
 void run_mha_bwd_constexpr(Flash_bwd_params &params, cudaStream_t stream) {
-    if constexpr (kNFunc == 3) {
+    if constexpr (kNFunc > 0) {
         TORCH_CHECK(!Has_softcap, "Arbitrary-mask backward does not support softcap.");
         TORCH_CHECK(params.is_bf16, "Arbitrary-mask backward only supports bf16.");
         #ifndef FLASHATTENTION_DISABLE_HDIM64
-        if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, false, 3>(params, stream); }
+        if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, false, kNFunc>(params, stream); }
         #endif
         #ifndef FLASHATTENTION_DISABLE_HDIM256
-        if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, false, 3>(params, stream); }
+        if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, false, kNFunc>(params, stream); }
         #endif
         TORCH_CHECK(
             false,
@@ -1456,6 +1461,36 @@ void run_mha_bwd_constexpr(Flash_bwd_params &params, cudaStream_t stream) {
         if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap, kNFunc>(params, stream); }
         #endif
     }
+}
+
+std::tuple<int64_t, int64_t> get_arbitrary_block_size(int64_t head_dim, bool is_backward) {
+    int const head_size_rounded = round_up_headdim(head_dim);
+    TORCH_CHECK(
+        head_size_rounded == 64 || head_size_rounded == 256,
+        "Arbitrary-mask kernels currently support head_dim 64 or 256 only."
+    );
+    if (is_backward) {
+        auto tile_size = tile_size_bwd_sm90(
+            head_size_rounded,
+            false,  // is_causal
+            false,  // is_local
+            true,   // is_arbitrary
+            false   // has_softcap
+        );
+        return {std::get<0>(tile_size), std::get<1>(tile_size)};
+    }
+    auto tile_size = tile_size_fwd_sm90(
+        head_size_rounded,
+        head_size_rounded,
+        false,  // is_causal
+        false,  // is_local
+        true,   // is_arbitrary
+        2,      // bf16 element size
+        false,  // v_colmajor
+        false,  // paged_kv_non_TMA
+        false   // softcap
+    );
+    return {std::get<0>(tile_size), std::get<1>(tile_size)};
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
@@ -1789,6 +1824,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
         TORCH_CHECK(arbitrary_func.dtype() == torch::kInt32, "arbitrary_func must have dtype int32");
         TORCH_CHECK(arbitrary_func.dim() == 4, "arbitrary_func must be 4D [batch, head_q, func_num, seqlen_q+256]");
         TORCH_CHECK(arbitrary_func.size(2) % 2 == 1, "arbitrary_func func_num must be odd");
+        TORCH_CHECK(arbitrary_func.size(2) <= FLASHATTENTION_MAX_NUM_FUNC,
+                    "arbitrary_func func_num must be <= FLASHATTENTION_MAX_NUM_FUNC");
         TORCH_CHECK(
             arbitrary_func.size(3) >= seqlen_q + 256,
             "arbitrary_func seqlen_q dimension must be >= seqlen_q + 256"
@@ -2044,6 +2081,7 @@ mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen 
 }
 
 TORCH_LIBRARY(flash_attn_3, m) {
+    m.def("get_arbitrary_block_size(int head_dim, bool is_backward) -> (int, int)");
     m.def("fwd("
         "Tensor q,"
         "Tensor k,"
@@ -2157,4 +2195,8 @@ TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
     m.impl("bwd", &mha_bwd);
     m.impl("fwd_combine", &mha_combine);
     m.impl("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata);
+}
+
+TORCH_LIBRARY_IMPL(flash_attn_3, CatchAll, m) {
+    m.impl("get_arbitrary_block_size", &get_arbitrary_block_size);
 }

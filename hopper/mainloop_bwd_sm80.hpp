@@ -1133,7 +1133,8 @@ struct CollectiveMainloopBwdSm80 {
             auto arbitrary_mask_fn = [&](auto& tSrS, int m_block) {
                 if constexpr (Is_arbitrary) {
                     auto gMaskFunc = construct_gMaskFunc(m_block);
-                    mask.template apply<true /*Seqlenk_mask*/, /*Causal_mask=*/false, /*Local_mask=*/false, /*Arbitrary_mask=*/true, kNFunc>(tSrS, m_block, n_block, &gMaskFunc);
+                    mask.template apply<true /*Seqlenk_mask*/, /*Causal_mask=*/false, /*Local_mask=*/false, /*Arbitrary_mask=*/true, kNFunc>(
+                        tSrS, m_block, n_block, &gMaskFunc, int(get<1>(params.shape_mask_func)));
                 }
             };
             // No mask function (for full_blocks)

@@ -55,7 +55,7 @@ struct Mask {
         typename Engine, typename Layout, typename MaskFuncTensor>
     CUTLASS_DEVICE
     void apply(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block,
-               MaskFuncTensor const* gMaskFunc) const {
+               MaskFuncTensor const* gMaskFunc, const int arbitrary_func_num=kNFunc) const {
         static_assert(!(Causal_mask && Local_mask), "Cannot be both causal and local");
         static_assert(!(Arbitrary_mask && (Causal_mask || Local_mask)), "Arbitrary_mask cannot be combined with Causal_mask or Local_mask");
         static_assert(!Arbitrary_mask || kNFunc > 0, "When Arbitrary_mask is true, kNFunc must be > 0");
@@ -106,8 +106,13 @@ struct Mask {
                 col_max[0] = col_max_0;
                 #pragma unroll
                 for (int i = 0; i < kNumIntervals; ++i) {
-                    col_min[i] = (*gMaskFunc)(2 * i + 1, row_idx_local);
-                    col_max[i + 1] = (*gMaskFunc)(2 * i + 2, row_idx_local);
+                    if (2 * i + 2 < arbitrary_func_num) {
+                        col_min[i] = (*gMaskFunc)(2 * i + 1, row_idx_local);
+                        col_max[i + 1] = (*gMaskFunc)(2 * i + 2, row_idx_local);
+                    } else {
+                        col_min[i] = 1;
+                        col_max[i + 1] = 0;
+                    }
                 }
                 #pragma unroll
                 for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {

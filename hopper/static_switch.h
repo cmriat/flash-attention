@@ -204,6 +204,10 @@
   }()
 
 
+#ifndef FLASHATTENTION_MAX_NUM_FUNC
+  #define FLASHATTENTION_MAX_NUM_FUNC 3
+#endif
+
 #ifdef FLASHATTENTION_DISABLE_ARBITRARY
   #define NFUNC_SWITCH(IS_ARBITRARY, NFUNC_VALUE, CONST_NAME, ...)                               \
   [&] {                                                                                          \
@@ -217,7 +221,7 @@
       constexpr static int CONST_NAME = 0;                                                       \
       return __VA_ARGS__();                                                                      \
     }                                                                                            \
-    constexpr static int CONST_NAME = 3;                                                         \
+    constexpr static int CONST_NAME = FLASHATTENTION_MAX_NUM_FUNC;                               \
     return __VA_ARGS__();                                                                        \
   }()
 #endif

@@ -62,6 +62,11 @@ def _unpack_block_sparse(
     return tuple(maybe_contiguous(t) for t in tensors)
 
 
+def get_arbitrary_block_size(head_dim: int, *, is_backward: bool = False) -> Tuple[int, int]:
+    block_m, block_n = flash_attn_3_gpu.get_arbitrary_block_size(int(head_dim), bool(is_backward))
+    return int(block_m), int(block_n)
+
+
 def round_multiple(x, m):
     return (x + m - 1) // m * m
 

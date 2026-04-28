@@ -336,7 +336,12 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
 template<int Arch, typename T, int kHeadDim, bool Has_softcap, int kNFunc>
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream) {
     static constexpr bool Is_arbitrary = kNFunc > 0;
-    if constexpr (Is_arbitrary) {        // Get all configuration from tile_size.h (single source of truth) - same pattern as forward
+    if constexpr (Is_arbitrary) {
+        FLASH_CHECK(params.arbitrary_func_num > 0 && params.arbitrary_func_num <= kNFunc && params.arbitrary_func_num % 2 == 1,
+            "Runtime arbitrary_func_num (%d) must be positive, odd, and <= compile-time max (%d). "
+            "Please rebuild with a larger FLASH_ATTENTION_MAX_NUM_FUNC if needed",
+            params.arbitrary_func_num, kNFunc);
+        // Get all configuration from tile_size.h (single source of truth) - same pattern as forward
         // Returns {kBlockM, kBlockN, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
         //          NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs}
         static constexpr auto kConfig = Arch >= 90

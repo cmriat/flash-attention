@@ -224,6 +224,10 @@ template <int Arch, typename T, int kHeadDim, int kHeadDimV, int kNFunc>
 void run_mha_fwd_arbitrary_(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(Arch == 90, "Gemma arbitrary forward is Hopper-only");
     static_assert(cute::is_same_v<T, cutlass::bfloat16_t>, "Gemma arbitrary forward is bf16-only");
+    FLASH_CHECK(params.arbitrary_func_num > 0 && params.arbitrary_func_num <= kNFunc && params.arbitrary_func_num % 2 == 1,
+                "Runtime arbitrary_func_num (%d) must be positive, odd, and <= compile-time max (%d). "
+                "Please rebuild with a larger FLASH_ATTENTION_MAX_NUM_FUNC if needed",
+                params.arbitrary_func_num, kNFunc);
     using T_out = T;
     VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
         run_flash_fwd_arbitrary<Arch, kHeadDim, kHeadDimV, kNFunc, T, T_out, Varlen>(params, stream);
