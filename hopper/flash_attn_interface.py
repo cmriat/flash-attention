@@ -129,6 +129,13 @@ def _flash_attn_forward(
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
     learnable_sink: Optional[torch.Tensor] = None,
+    block_sparse_mask_cnt: Optional[torch.Tensor] = None,
+    block_sparse_mask_offset: Optional[torch.Tensor] = None,
+    block_sparse_mask_idx: Optional[torch.Tensor] = None,
+    block_sparse_full_cnt: Optional[torch.Tensor] = None,
+    block_sparse_full_offset: Optional[torch.Tensor] = None,
+    block_sparse_full_idx: Optional[torch.Tensor] = None,
+    arbitrary_func: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -141,6 +148,18 @@ def _flash_attn_forward(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     seqlens_rotary = maybe_contiguous(seqlens_rotary)
+    block_sparse_tensors = [
+        maybe_contiguous(x)
+        for x in (
+            block_sparse_mask_cnt,
+            block_sparse_mask_offset,
+            block_sparse_mask_idx,
+            block_sparse_full_cnt,
+            block_sparse_full_offset,
+            block_sparse_full_idx,
+        )
+    ]
+    arbitrary_func = maybe_contiguous(arbitrary_func)
     out, softmax_lse, out_accum, softmax_lse_accum = flash_attn_3_gpu.fwd(
         q,
         k,
@@ -177,6 +196,8 @@ def _flash_attn_forward(
         pack_gqa,
         sm_margin,
         learnable_sink,
+        *block_sparse_tensors,
+        arbitrary_func,
     )
 
     if out_accum is None:
@@ -225,6 +246,13 @@ def _flash_attn_forward_fake(
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
     learnable_sink: Optional[torch.Tensor] = None,
+    block_sparse_mask_cnt: Optional[torch.Tensor] = None,
+    block_sparse_mask_offset: Optional[torch.Tensor] = None,
+    block_sparse_mask_idx: Optional[torch.Tensor] = None,
+    block_sparse_full_cnt: Optional[torch.Tensor] = None,
+    block_sparse_full_offset: Optional[torch.Tensor] = None,
+    block_sparse_full_idx: Optional[torch.Tensor] = None,
+    arbitrary_func: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Symbolic fake implementation of flash attention forward.
@@ -1027,44 +1055,41 @@ class FlashAttnVarlenArbitraryFunc(torch.autograd.Function):
         cu_seqlens_q, cu_seqlens_k = [maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k)]
         seqused_q, seqused_k = [maybe_contiguous(x) for x in (seqused_q, seqused_k)]
         q2k_tensors = _unpack_block_sparse(q2k_block_sparse, name="q2k_block_sparse")
-        out, softmax_lse, out_accum, *_ = flash_attn_3_gpu.fwd(
+        out, softmax_lse, out_accum, *_ = _flash_attn_forward(
             q,
             k,
             v,
-            None,
-            None,
-            qv,
-            None,
+            None,  # k_new
+            None,  # v_new
+            qv,  # qv
+            None,  # out
             cu_seqlens_q,
             cu_seqlens_k,
-            None,
+            None,  # cu_seqlens_k_new
             seqused_q,
             seqused_k,
             max_seqlen_q,
             max_seqlen_k,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            q_descale,
-            k_descale,
-            v_descale,
+            None, None, None,  # page_table, kv_batch_idx, leftpad_k
+            None, None, None,  # rotary_cos, rotary_sin, seqlens_rotary
+            q_descale, k_descale, v_descale,
             softmax_scale,
             causal,
-            window_size[0],
-            window_size[1],
-            attention_chunk,
-            softcap,
-            True,
-            None,
-            num_splits,
-            pack_gqa,
-            sm_margin,
-            learnable_sink,
-            *q2k_tensors,
-            arbitrary_func,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            attention_chunk=attention_chunk,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            sm_margin=sm_margin,
+            learnable_sink=learnable_sink,
+            block_sparse_mask_cnt=q2k_tensors[0],
+            block_sparse_mask_offset=q2k_tensors[1],
+            block_sparse_mask_idx=q2k_tensors[2],
+            block_sparse_full_cnt=q2k_tensors[3],
+            block_sparse_full_offset=q2k_tensors[4],
+            block_sparse_full_idx=q2k_tensors[5],
+            arbitrary_func=arbitrary_func,
         )
         ctx.save_for_backward(q, k, v, out, softmax_lse, out_accum, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.max_seqlen_q = max_seqlen_q
