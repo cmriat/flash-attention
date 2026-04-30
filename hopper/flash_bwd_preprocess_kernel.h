@@ -50,6 +50,10 @@ public:
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
+    using GmemTiledCopyOAccum = decltype(
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+                        GmemLayoutAtom{},
+                        Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));
 
     static constexpr int kGmemElemsPerLoadAccum = sizeof(cute::uint128_t) / sizeof(ElementAccum);
     static_assert((kBlockM * kHeadDim / kGmemElemsPerLoadAccum) % MaxThreadsPerBlock == 0, "MaxThreadsPerBlock must divide kBlockM * kHeadDim / kGmemElemsPerLoadAccum");
@@ -71,6 +75,8 @@ public:
         Element const* ptr_O;
         ShapeO const shape_O;
         StrideO const stride_O;
+        ElementAccum const* ptr_O_accum;
+        StrideO const stride_O_accum;
         Element const* ptr_dO;
         StrideO const stride_dO;
         float* ptr_dPsum;
@@ -80,6 +86,8 @@ public:
         StridedPsum const stride_LSE;
         float *ptr_LSE_log2;
         StridedPsum const stride_LSE_log2;
+        float const* ptr_Sink;
+        float* ptr_dSink;
         ElementAccum* ptr_dQaccum;
         ShapedQaccum const shape_dQaccum;
         StridedQaccum const stride_dQaccum;
@@ -94,6 +102,8 @@ public:
         Element const* ptr_O;
         ShapeO const shape_O;
         StrideO const stride_O;
+        ElementAccum const* ptr_O_accum;
+        StrideO const stride_O_accum;
         Element const* ptr_dO;
         StrideO const stride_dO;
         float* ptr_dPsum;
@@ -103,6 +113,8 @@ public:
         StridedPsum const stride_LSE;
         float* ptr_LSE_log2;
         StridedPsum const stride_LSE_log2;
+        float const* ptr_Sink;
+        float* ptr_dSink;
         ElementAccum* ptr_dQaccum;
         ShapedQaccum const shape_dQaccum;
         StridedQaccum const stride_dQaccum;
@@ -120,6 +132,8 @@ public:
             args.ptr_O,
             args.shape_O,
             args.stride_O,
+            args.ptr_O_accum,
+            args.stride_O_accum,
             args.ptr_dO,
             args.stride_dO,
             args.ptr_dPsum,
@@ -129,6 +143,8 @@ public:
             args.stride_LSE,
             args.ptr_LSE_log2,
             args.stride_LSE_log2,
+            args.ptr_Sink,
+            args.ptr_dSink,
             args.ptr_dQaccum,
             args.shape_dQaccum,
             args.stride_dQaccum,
@@ -182,9 +198,11 @@ public:
         // (8, kBlockM / 32, kHeadDim / 64) or (8, kBlockM / 16, kHeadDim / 128)
         Tensor tOrO = make_fragment_like(tOgO);
         Tensor tOrdO = make_fragment_like(tOgdO);
-        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true, /*Clearn_OOB_K=*/true>(
-            gmem_tiled_copy_O, tOgO, tOrO, tOcO, tOpO, seqlen_o - m_block * kBlockM
-        );
+        if (params.ptr_O_accum == nullptr) {
+            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true, /*Clearn_OOB_K=*/true>(
+                gmem_tiled_copy_O, tOgO, tOrO, tOcO, tOpO, seqlen_o - m_block * kBlockM
+            );
+        }
         flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true, /*Clearn_OOB_K=*/true>(
             gmem_tiled_copy_O, tOgdO, tOrdO, tOcO, tOpO, seqlen_o - m_block * kBlockM
         );
@@ -192,12 +210,37 @@ public:
 
         // Reshape from e.g. (8, kBlockM / 32, kHeadDim / 64) to (kBlockM / 32, (8, kHeadDim / 64))
         Layout l = make_layout(get<1>(tOrO.layout()), make_layout(get<0>(tOrO.layout()), get<2>(tOrO.layout())));
-        Tensor tOrO_l = make_tensor(tOrO.data(), l);
-        Tensor o_fp32 = make_tensor_like<float>(tOrO_l);
-        flash::convert_type_out(tOrO_l, o_fp32);
         Tensor tOrdO_l = make_tensor(tOrdO.data(), l);
         Tensor do_fp32 = make_tensor_like<float>(tOrdO_l);
         flash::convert_type_out(tOrdO_l, do_fp32);
+        Tensor o_fp32 = make_tensor_like<float>(do_fp32);
+        if (params.ptr_O_accum != nullptr) {
+            Tensor mOaccum = make_tensor(make_gmem_ptr(params.ptr_O_accum), params.shape_O, params.stride_O_accum)(_, _, bidh, !is_varlen ? bidb : 0);
+            Tensor gOaccum = local_tile(cute::domain_offset(make_coord(seqlen_info.offset, _0{}), mOaccum), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
+            GmemTiledCopyOAccum gmem_tiled_copy_Oaccum;
+            auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(thread_idx);
+            Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_S(gOaccum);
+            Tensor tOrOaccum = make_fragment_like(tOgOaccum);
+            Tensor tOcOaccum = gmem_thr_copy_Oaccum.partition_D(cO);
+            Tensor tOpOaccum = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
+            #pragma unroll
+            for (int k = 0; k < size(tOpOaccum); ++k) { tOpOaccum(k) = get<1>(tOcOaccum(_0{}, _0{}, k)) < get<1>(params.shape_O); }
+            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true, /*Clearn_OOB_K=*/true>(
+                gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, seqlen_o - m_block * kBlockM
+            );
+            Layout l_accum = make_layout(get<1>(tOrOaccum.layout()), make_layout(get<0>(tOrOaccum.layout()), get<2>(tOrOaccum.layout())));
+            Tensor tOrOaccum_l = make_tensor(tOrOaccum.data(), l_accum);
+            #pragma unroll
+            for (int mi = 0; mi < size<0>(o_fp32); ++mi) {
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(o_fp32); ++ni) {
+                    o_fp32(mi, ni) = tOrOaccum_l(mi, ni);
+                }
+            }
+        } else {
+            Tensor tOrO_l = make_tensor(tOrO.data(), l);
+            flash::convert_type_out(tOrO_l, o_fp32);
+        }
         // Sum across the last dimension
         Tensor dP_sum = make_tensor<float>(make_shape(size<0>(o_fp32)));
         #pragma unroll
@@ -217,7 +260,14 @@ public:
             #pragma unroll
             for (int mi = 0; mi < size(dP_sum); ++mi) {
                 int const row = get<0>(tOcO(_0{}, mi, _0{}));
-                gdPsum(row) = row < seqlen_o - m_block * kBlockM ? dP_sum(mi) : 0;
+                bool const row_is_valid = row < seqlen_o - m_block * kBlockM;
+                gdPsum(row) = row_is_valid ? dP_sum(mi) : 0;
+                if constexpr (ArchTag::kMinComputeCapability < 90) {
+                    if (row_is_valid && params.ptr_Sink != nullptr && params.ptr_dSink != nullptr) {
+                        float const sink_prob = expf(params.ptr_Sink[bidh] - gLSE(row));
+                        atomicAdd(params.ptr_dSink + bidh, -sink_prob * dP_sum(mi));
+                    }
+                }
             }
         }
 

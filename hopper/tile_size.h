@@ -8,7 +8,7 @@
 
 // Return {kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap}
 constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
-        int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,
+        int headdim, int headdim_v, bool is_causal, bool is_local, bool is_arbitrary=false, int element_size=2,
         bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false) {
     if (element_size == 2) {
         if (headdim <= 64) {
@@ -21,22 +21,22 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
                 return {128, 96, true, false};
             } else {
                 // Switch to tile size 192 x 192 for now
-                bool const use_blockN_128 = is_causal || is_local || paged_kv_non_TMA;
+                bool const use_blockN_128 = is_causal || is_local || is_arbitrary || paged_kv_non_TMA;
                 return {192, use_blockN_128 ? 128 : 192, use_blockN_128, true};
             }
             // Good for long seqlen (>= 4k) but suffers from tile quantization at short seqlen
             // return {192, is_causal || is_local ? 192 : 176, true, false};
         } else if (headdim <= 96) {
-            return {192, is_local || paged_kv_non_TMA ? 128 : 144, false, true};
+            return {192, is_local || is_arbitrary || paged_kv_non_TMA ? 128 : 144, false, true};
         } else if (headdim <= 128) {
-            bool const use_blockN_128 = is_causal || is_local || paged_kv_non_TMA;
+            bool const use_blockN_128 = is_causal || is_local || is_arbitrary || paged_kv_non_TMA;
             return {128, use_blockN_128 ? 128 : 176, true, true};
             // {128, 192, true, false} and {192, 128, false, true} are quite good too
             // 128 x 192 hits the limit of smem if MmaPV_is_RS, 128 x 144 hits the limit if !MmaPV_is_RS
         } else if (headdim <= 192) {
-            return {128, paged_kv_non_TMA || is_local ? 96 : (headdim_v <= 128 ? 128 : 112), true, true};  // 128 x 112 hits the limit of smem
+            return {128, paged_kv_non_TMA || is_local || is_arbitrary ? 96 : (headdim_v <= 128 ? 128 : 112), true, true};  // 128 x 112 hits the limit of smem
         } else {
-            return {128, is_local ? 64 : 80, true, true};  // 128 x 80 hits the limit of smem
+            return {128, is_local || is_arbitrary ? 64 : 80, true, true};  // 128 x 80 hits the limit of smem
         }
     } else {
         if (headdim <= 64) {
@@ -44,11 +44,11 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         } else if (headdim <= 96) {
             return {192, 128, true, true};
         } else if (headdim <= 128) {
-            return {128, paged_kv_non_TMA ? 160 : (v_colmajor || (softcap && is_local) ? 192 : 224), true, true};
+            return {128, paged_kv_non_TMA ? 160 : (v_colmajor || (softcap && (is_local || is_arbitrary)) ? 192 : 224), true, true};
         } else if (headdim <= 192) {
-            return {128, (paged_kv_non_TMA || softcap) && is_local ? 128 : 160, true, true};
+            return {128, (paged_kv_non_TMA || softcap) && (is_local || is_arbitrary) ? 128 : 160, true, true};
         } else {
-            return {128, is_local ? 64 : 128, true, !paged_kv_non_TMA};  // PagedKV uses more registers so we disabled IntraWGOverlap
+            return {128, is_local || is_arbitrary ? 64 : 128, true, !paged_kv_non_TMA};  // PagedKV uses more registers so we disabled IntraWGOverlap
         }
     }
 }
@@ -75,5 +75,62 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm8x(
     } else {
         // Placeholder for now
         return {128, 64, 8, 2, false};
+    }
+}
+
+
+// Return {kBlockM, kBlockN, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
+//         NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs}
+constexpr std::tuple<int, int, int, int, bool, bool, bool, int, int, int, int, bool>
+tile_size_bwd_sm90(int headdim, bool is_causal, bool is_local, bool is_arbitrary, bool has_softcap) {
+    if (headdim <= 64) {
+        int kBlockM = ((is_causal && has_softcap) || is_arbitrary) ? 96 : 128;
+        bool dQ_swapAB = kBlockM < 128;
+        return {kBlockM, 128, 2, 2, true, false, dQ_swapAB, 2, 1, 2, 2, false};
+    } else if (headdim <= 96) {
+        return {64, 128, 2, 2, true, false, false, 2, 1, 2, 1, true};
+    } else if (headdim <= 128) {
+        int kBlockM = (is_causal || is_local || has_softcap || is_arbitrary) ? 64 : 80;
+        bool dQ_swapAB = kBlockM == 80;
+        return {kBlockM, 128, 2, 2, true, false, dQ_swapAB, 2, 1, 2, 1, false};
+    } else if (headdim <= 192) {
+        return {64, 96, 1, 1, false, true, false, 3, 1, 1, 1, false};
+    } else {
+        return {64, 80, 1, 1, false, true, true, 2, 1, 1, 1, false};
+    }
+}
+
+// Return {kBlockM, kBlockN, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
+//         NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs}
+constexpr std::tuple<int, int, int, int, bool, bool, bool, int, int, int, int, bool>
+tile_size_bwd_sm8x(bool sm86_or_89, int headdim, bool is_causal, bool is_local, bool is_arbitrary, bool has_softcap) {
+    (void)is_causal;
+    (void)is_local;
+    (void)is_arbitrary;
+    (void)has_softcap;
+    if (sm86_or_89) {
+        if (headdim <= 64) {
+            return {64, 128, 2, 2, false, false, false, 2, 2, 4, 2, true};
+        } else if (headdim <= 96) {
+            return {64, 128, 1, 2, false, false, false, 2, 2, 4, 2, true};
+        } else if (headdim <= 128) {
+            return {64, 96, 1, 2, false, false, false, 2, 2, 2, 2, true};
+        } else if (headdim <= 192) {
+            return {64, 64, 1, 1, false, false, false, 2, 2, 2, 2, true};
+        } else {
+            return {32, 64, 1, 1, false, false, false, 2, 2, 2, 1, true};
+        }
+    } else {
+        if (headdim <= 64) {
+            return {128, 128, 2, 2, false, false, false, 2, 4, 4, 4, false};
+        } else if (headdim <= 96) {
+            return {64, 128, 2, 2, false, false, false, 2, 2, 4, 2, false};
+        } else if (headdim <= 128) {
+            return {64, 128, 2, 2, false, false, false, 2, 2, 2, 2, false};
+        } else if (headdim <= 192) {
+            return {64, 80, 1, 2, false, true, false, 2, 4, 2, 2, false};
+        } else {
+            return {64, 64, 1, 1, false, false, false, 2, 4, 2, 2, false};
+        }
     }
 }

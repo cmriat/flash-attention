@@ -319,6 +319,38 @@ struct CollectiveEpilogueFwd {
             }
         }
 
+
+        // In the non-split arbitrary-mask path, ptr_O_partial is reused as a
+        // same-shape fp32 shadow of the final output. Backward uses it to form
+        // dPsum = sum(dO * O) without first rounding O to bf16/fp16.
+        if (!is_split && params.ptr_O_partial != nullptr) {
+            Tensor mOpartial = make_tensor(make_gmem_ptr(params.ptr_O_partial + offset_o * get<0>(params.stride_O_partial)), params.shape_O_packed, params.stride_O_partial_packed)(_, _, bidh, !is_varlen ? bidb : 0, _0{});
+            Tensor gOpartial = local_tile(mOpartial, select<0, 1>(TileShape_MNK_PV{}), make_coord(m_block, _0{}));  // (M, K)
+            if constexpr (!PackGQA) {
+                static constexpr int kGmemElemsPerStoreDirect = 2;
+                cute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementPartial> gmem_copy_direct;
+                Tensor tOrO_rowcol = make_tensor(tOrO.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
+                Tensor tOrO_copy = cute::tiled_divide(tOrO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
+                Tensor tOgO = thread_mma.partition_C(gOpartial);
+                Tensor tOgO_rowcol = make_tensor(tOgO.data(), flash::convert_layout_acc_rowcol(tOgO.layout()));
+                Tensor tOgO_copy = cute::tiled_divide(tOgO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
+                Tensor taccOcO_col = taccOcO_rowcol(_0{}, _);
+                #pragma unroll
+                for (int m = 0; m < size(taccOcO_row); ++m) {
+                    if (get<0>(taccOcO_row(m)) < seqlen_o - m_block * kBlockM) {
+                        #pragma unroll
+                        for (int k = 0; k < size(taccOcO_col) / kGmemElemsPerStoreDirect; ++k) {
+                            if (get<1>(taccOcO_col(k * kGmemElemsPerStoreDirect)) < get<1>(params.shape_O)) {
+                                cute::copy(gmem_copy_direct, tOrO_copy(_, m, k), tOgO_copy(_, m, k));
+                            }
+                        }
+                    }
+                }
+            } else {
+                PackGQApartial_t::store_O_direct(mOpartial, tOrO, tiled_mma, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);
+            }
+        }
+
         // Step 3: Write O from smem -> gmem
         if constexpr (Use_TMA_O) {
             Tensor mO = params.tma_store_O.get_tma_tensor(params.shape_O)(_, _, bidh, bidb, split_idx);

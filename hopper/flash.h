@@ -145,6 +145,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_e4m3;
     bool is_causal;
     bool is_local;
+    bool is_arbitrary;
 
     bool is_rotary_interleaved;
 
@@ -166,6 +167,28 @@ struct Flash_fwd_params : public Qkv_params {
     int arch;
     int num_sm;
     void *__restrict__ learnable_sink_ptr;
+
+    // Block sparsity parameters for the arbitrary forward path.
+    bool use_block_sparsity;
+    int * __restrict__ block_sparse_mask_cnt;
+    int * __restrict__ block_sparse_mask_offset;
+    int * __restrict__ block_sparse_mask_idx;
+    int * __restrict__ block_sparse_full_cnt;
+    int * __restrict__ block_sparse_full_offset;
+    int * __restrict__ block_sparse_full_idx;
+    int block_sparse_num_blocks;
+    int block_sparse_num_heads;
+    int block_sparse_num_batches;
+
+    // Arbitrary mask function tensor for element-level masking.
+    int * __restrict__ mask_func_ptr;
+    int func_seqlen;
+    int arbitrary_func_num;
+    int func_head;
+    int func_batch;
+    index_t func_batch_stride;
+    index_t func_head_stride;
+    index_t func_nfunc_stride;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -219,8 +242,10 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
+template <int Arch, typename T, int kHeadDim, int kHeadDimV, int kNFunc>
+void run_mha_fwd_arbitrary_(Flash_fwd_params &params, cudaStream_t stream);
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
-template <int Arch, typename T, int kHeadDim, bool Has_softcap>
+template <int Arch, typename T, int kHeadDim, bool Has_softcap, int kNFunc = 0>
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 template <typename T, typename Tpartial, int kBlockK>
 void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);

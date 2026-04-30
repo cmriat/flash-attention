@@ -6,8 +6,19 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include <cutlass/cutlass.h>
+
+#define FLASH_CHECK(cond, ...)                                                                                 \
+    do {                                                                                                       \
+        if (!(cond)) {                                                                                         \
+            fprintf(stderr, "FlashAttention arbitrary-mask error (%s:%d): ", __FILE__, __LINE__);              \
+            fprintf(stderr, __VA_ARGS__);                                                                      \
+            fprintf(stderr, "\n");                                                                             \
+            exit(1);                                                                                           \
+        }                                                                                                      \
+    } while(0)
 
 #define CHECK_CUDA(call)                        \
     do {                                                                                                  \

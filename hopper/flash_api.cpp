@@ -30,6 +30,10 @@ PyObject* PyInit__C(void)
         -1,     /* size of per-interpreter state of the module,
                     or -1 if the module keeps state in global variables. */
         NULL,   /* methods */
+        NULL,   /* m_slots */
+        NULL,   /* m_traverse */
+        NULL,   /* m_clear */
+        NULL,   /* m_free */
     };
     return PyModule_Create(&module_def);
 }
@@ -364,11 +368,40 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
     }
 }
 
+template <int Arch, int kNFunc>
+void run_mha_fwd_arbitrary_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
+    if constexpr (Arch != 90) {
+        TORCH_CHECK(false, "Arbitrary-mask forward currently supports Hopper only.");
+    } else {
+        TORCH_CHECK(params.is_bf16 && !params.is_e4m3, "Arbitrary-mask forward currently supports BF16 only.");
+        TORCH_CHECK(params.d == params.dv, "Arbitrary-mask forward currently requires matching Q/K and V head dims.");
+        #ifndef FLASHATTENTION_DISABLE_HDIM64
+        if (params.d == 64) {
+            return run_mha_fwd_arbitrary_<90, cutlass::bfloat16_t, 64, 64, kNFunc>(params, stream);
+        }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM256
+        if (params.d == 256) {
+            return run_mha_fwd_arbitrary_<90, cutlass::bfloat16_t, 256, 256, kNFunc>(params, stream);
+        }
+        #endif
+        TORCH_CHECK(false, "Arbitrary-mask forward currently supports headdim 64 or 256 only.");
+    }
+}
+
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
     TORCH_CHECK(params.num_splits >= 1);
+    if (params.is_arbitrary) {
+        ARCH_SWITCH(params.arch, Arch, [&] {
+            NFUNC_SWITCH(params.is_arbitrary, params.arbitrary_func_num, kNFunc, [&] {
+                run_mha_fwd_arbitrary_constexpr<Arch, kNFunc>(params, stream);
+            });
+        });
+        return;
+    }
     ARCH_SWITCH(params.arch, Arch, [&] {
         SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
             PAGEDKV_SWITCH(params.page_table && !params.pagedkv_tma, PagedKVNonTMA, [&] {
@@ -413,9 +446,10 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
 }
 
 inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
+    if (params.is_arbitrary) { return false; }
     if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr) { return false; }
     // This needs to match the kernel configs
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_arbitrary, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f);
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     int const kBlockN = std::get<1>(kBlockMN_kernel_args_sm90);
     // Heuristic: when seqlen_q <= kBlockM, we're not compute bound, and somehow using TMA is slower,
@@ -424,6 +458,7 @@ inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
 }
 
 inline bool get_pack_gqa(Flash_fwd_params const& params) {
+    if (params.is_arbitrary) { return false; }
     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation and binary size.
     // Has little effect on speed.
     if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
@@ -433,13 +468,14 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // params.page_table must already be set
     if (params.h == params.h_k) { return false; }
     // This needs to match the kernel configs
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_arbitrary, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM);
     #endif
 }
 
 inline int get_num_splits(Flash_fwd_params const& params) {
+    if (params.is_arbitrary) { return 1; }
     #ifdef FLASHATTENTION_DISABLE_SPLIT
     return 1;
     #else
@@ -447,7 +483,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // params.page_table must already be set
     // This needs to match the kernel configs
     bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_arbitrary, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
     // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
     // has not been set here. It's OK though because we might just underestimate kBlockN a bit
     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
@@ -650,7 +686,7 @@ mha_fwd_get_scheduler_metadata(
     }
 
     if (use_prepare_varlen) {
-        auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
+        auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_arbitrary, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
         auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
@@ -705,7 +741,14 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
         int64_t sm_margin,
-        std::optional<at::Tensor> learnable_sink_
+        std::optional<at::Tensor> learnable_sink_,
+        std::optional<at::Tensor> block_sparse_mask_cnt_,
+        std::optional<at::Tensor> block_sparse_mask_offset_,
+        std::optional<at::Tensor> block_sparse_mask_idx_,
+        std::optional<at::Tensor> block_sparse_full_cnt_,
+        std::optional<at::Tensor> block_sparse_full_offset_,
+        std::optional<at::Tensor> block_sparse_full_idx_,
+        std::optional<at::Tensor> arbitrary_func_
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -989,16 +1032,147 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
     params.num_splits_dynamic_ptr = !use_prepare_varlen ? nullptr : reinterpret_cast<int*>(1);
 
+    bool const has_any_block_sparse =
+        block_sparse_mask_cnt_.has_value() || block_sparse_mask_offset_.has_value() || block_sparse_mask_idx_.has_value() ||
+        block_sparse_full_cnt_.has_value() || block_sparse_full_offset_.has_value() || block_sparse_full_idx_.has_value();
+    bool const has_all_block_sparse =
+        block_sparse_mask_cnt_.has_value() && block_sparse_mask_offset_.has_value() && block_sparse_mask_idx_.has_value() &&
+        block_sparse_full_cnt_.has_value() && block_sparse_full_offset_.has_value() && block_sparse_full_idx_.has_value();
+
+    params.is_arbitrary = arbitrary_func_.has_value();
+    TORCH_CHECK(!has_any_block_sparse || params.is_arbitrary,
+                "Block-sparse metadata is only supported together with arbitrary_func.");
+    if (params.is_arbitrary) {
+        TORCH_CHECK(has_all_block_sparse, "Arbitrary-mask forward requires all 6 q2k block-sparse tensors.");
+        TORCH_CHECK(params.arch == 90, "Arbitrary-mask forward currently supports Hopper only.");
+        TORCH_CHECK(q_type == at::ScalarType::BFloat16, "Arbitrary-mask forward currently supports BF16 only.");
+        TORCH_CHECK(out_type == q_type, "Arbitrary-mask forward currently requires BF16 output.");
+        TORCH_CHECK(!paged_KV, "Arbitrary-mask forward does not support paged KV.");
+        TORCH_CHECK(!k_new_.has_value(), "Arbitrary-mask forward does not support appending KV.");
+        TORCH_CHECK(!q_v_.has_value(), "Arbitrary-mask forward does not support q_v.");
+        TORCH_CHECK(!learnable_sink_.has_value(), "Arbitrary-mask forward does not support learnable_sink.");
+        TORCH_CHECK(!is_causal, "Arbitrary-mask forward expects causal=False and encodes its own mask.");
+        TORCH_CHECK(window_size_left == -1 && window_size_right == -1, "Arbitrary-mask forward does not support local window flags.");
+        TORCH_CHECK(attention_chunk == 0, "Arbitrary-mask forward does not support attention_chunk.");
+        TORCH_CHECK(softcap == 0.0, "Arbitrary-mask forward does not support softcap.");
+        TORCH_CHECK(head_size == head_size_v, "Arbitrary-mask forward currently requires matching Q/K and V head dims.");
+
+        auto arbitrary_func = arbitrary_func_.value();
+        CHECK_DEVICE(arbitrary_func); CHECK_CONTIGUOUS(arbitrary_func);
+        TORCH_CHECK(arbitrary_func.dtype() == torch::kInt32, "arbitrary_func must have dtype int32");
+        TORCH_CHECK(arbitrary_func.dim() == 4, "arbitrary_func must be 4D [batch, head_q, func_num, seqlen_q+256]");
+        TORCH_CHECK(arbitrary_func.size(2) % 2 == 1,
+                    "arbitrary_func func_num must be odd. Got ", arbitrary_func.size(2));
+        TORCH_CHECK(arbitrary_func.size(2) <= FLASHATTENTION_MAX_NUM_FUNC,
+                    "arbitrary_func func_num must be <= FLASHATTENTION_MAX_NUM_FUNC (",
+                    FLASHATTENTION_MAX_NUM_FUNC, "). Got ", arbitrary_func.size(2));
+        TORCH_CHECK(arbitrary_func.size(3) >= seqlen_q + 256,
+                    "arbitrary_func seqlen_q dimension must be >= seqlen_q + 256. Got ",
+                    arbitrary_func.size(3), ", expected >= ", seqlen_q + 256);
+        TORCH_CHECK(arbitrary_func.size(0) == batch_size || arbitrary_func.size(0) == 1,
+                    "arbitrary_func batch dimension must be 1 or match Q batch size.");
+        TORCH_CHECK(arbitrary_func.size(1) == num_heads || arbitrary_func.size(1) == 1,
+                    "arbitrary_func head dimension must be 1 or match Q num_heads.");
+        params.mask_func_ptr = arbitrary_func.data_ptr<int>();
+        params.func_seqlen = arbitrary_func.size(3);
+        params.arbitrary_func_num = arbitrary_func.size(2);
+        params.func_head = arbitrary_func.size(1);
+        params.func_batch = arbitrary_func.size(0);
+        params.func_batch_stride = arbitrary_func.stride(0);
+        params.func_head_stride = arbitrary_func.stride(1);
+        params.func_nfunc_stride = arbitrary_func.stride(2);
+
+        auto block_sparse_mask_cnt = block_sparse_mask_cnt_.value();
+        auto block_sparse_mask_offset = block_sparse_mask_offset_.value();
+        auto block_sparse_mask_idx = block_sparse_mask_idx_.value();
+        auto block_sparse_full_cnt = block_sparse_full_cnt_.value();
+        auto block_sparse_full_offset = block_sparse_full_offset_.value();
+        auto block_sparse_full_idx = block_sparse_full_idx_.value();
+        CHECK_DEVICE(block_sparse_mask_cnt); CHECK_CONTIGUOUS(block_sparse_mask_cnt);
+        CHECK_DEVICE(block_sparse_mask_offset); CHECK_CONTIGUOUS(block_sparse_mask_offset);
+        CHECK_DEVICE(block_sparse_mask_idx); CHECK_CONTIGUOUS(block_sparse_mask_idx);
+        CHECK_DEVICE(block_sparse_full_cnt); CHECK_CONTIGUOUS(block_sparse_full_cnt);
+        CHECK_DEVICE(block_sparse_full_offset); CHECK_CONTIGUOUS(block_sparse_full_offset);
+        CHECK_DEVICE(block_sparse_full_idx); CHECK_CONTIGUOUS(block_sparse_full_idx);
+        TORCH_CHECK(block_sparse_mask_cnt.dtype() == torch::kInt32, "block_sparse_mask_cnt must have dtype int32");
+        TORCH_CHECK(block_sparse_mask_offset.dtype() == torch::kInt32, "block_sparse_mask_offset must have dtype int32");
+        TORCH_CHECK(block_sparse_mask_idx.dtype() == torch::kInt32, "block_sparse_mask_idx must have dtype int32");
+        TORCH_CHECK(block_sparse_full_cnt.dtype() == torch::kInt32, "block_sparse_full_cnt must have dtype int32");
+        TORCH_CHECK(block_sparse_full_offset.dtype() == torch::kInt32, "block_sparse_full_offset must have dtype int32");
+        TORCH_CHECK(block_sparse_full_idx.dtype() == torch::kInt32, "block_sparse_full_idx must have dtype int32");
+        TORCH_CHECK(block_sparse_mask_cnt.dim() == 3, "block_sparse_mask_cnt must be 3D [B, H, num_m_blocks]");
+        TORCH_CHECK(block_sparse_full_cnt.dim() == 3, "block_sparse_full_cnt must be 3D [B, H, num_m_blocks]");
+        TORCH_CHECK(block_sparse_mask_offset.dim() == 1, "block_sparse_mask_offset must be 1D [B*H*num_m_blocks + 1]");
+        TORCH_CHECK(block_sparse_full_offset.dim() == 1, "block_sparse_full_offset must be 1D [B*H*num_m_blocks + 1]");
+        TORCH_CHECK(block_sparse_mask_idx.dim() == 1, "block_sparse_mask_idx must be 1D [total_mask_blocks]");
+        TORCH_CHECK(block_sparse_full_idx.dim() == 1, "block_sparse_full_idx must be 1D [total_full_blocks]");
+        TORCH_CHECK(block_sparse_mask_cnt.sizes() == block_sparse_full_cnt.sizes(),
+                    "block_sparse_mask_cnt and block_sparse_full_cnt must have the same shape");
+        TORCH_CHECK(block_sparse_mask_cnt.size(0) == batch_size || block_sparse_mask_cnt.size(0) == 1,
+                    "block_sparse_mask_cnt batch dimension must be 1 or match Q batch size.");
+        TORCH_CHECK(block_sparse_mask_cnt.size(1) == num_heads || block_sparse_mask_cnt.size(1) == 1,
+                    "block_sparse_mask_cnt head dimension must be 1 or match Q num_heads.");
+        TORCH_CHECK(block_sparse_full_cnt.size(0) == batch_size || block_sparse_full_cnt.size(0) == 1,
+                    "block_sparse_full_cnt batch dimension must be 1 or match Q batch size.");
+        TORCH_CHECK(block_sparse_full_cnt.size(1) == num_heads || block_sparse_full_cnt.size(1) == 1,
+                    "block_sparse_full_cnt head dimension must be 1 or match Q num_heads.");
+        TORCH_CHECK(block_sparse_mask_offset.size(0) == block_sparse_mask_cnt.numel() + 1,
+                    "block_sparse_mask_offset size must equal block_sparse_mask_cnt.numel() + 1.");
+        TORCH_CHECK(block_sparse_full_offset.size(0) == block_sparse_full_cnt.numel() + 1,
+                    "block_sparse_full_offset size must equal block_sparse_full_cnt.numel() + 1.");
+
+        auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, false, false, true, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, false /*softcap*/);
+        int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
+        int const expected_num_m_blocks = (seqlen_q + kBlockM - 1) / kBlockM;
+        TORCH_CHECK(block_sparse_mask_cnt.size(2) == expected_num_m_blocks,
+                    "block_sparse_* num_m_blocks must match the arbitrary kernel tile geometry. Got ",
+                    block_sparse_mask_cnt.size(2), ", expected ", expected_num_m_blocks);
+
+        params.use_block_sparsity = true;
+        params.block_sparse_mask_cnt = block_sparse_mask_cnt.data_ptr<int>();
+        params.block_sparse_mask_offset = block_sparse_mask_offset.data_ptr<int>();
+        params.block_sparse_mask_idx = block_sparse_mask_idx.data_ptr<int>();
+        params.block_sparse_full_cnt = block_sparse_full_cnt.data_ptr<int>();
+        params.block_sparse_full_offset = block_sparse_full_offset.data_ptr<int>();
+        params.block_sparse_full_idx = block_sparse_full_idx.data_ptr<int>();
+        params.block_sparse_num_blocks = block_sparse_mask_cnt.size(2);
+        params.block_sparse_num_heads = block_sparse_mask_cnt.size(1);
+        params.block_sparse_num_batches = block_sparse_mask_cnt.size(0);
+    } else {
+        params.use_block_sparsity = false;
+        params.block_sparse_mask_cnt = nullptr;
+        params.block_sparse_mask_offset = nullptr;
+        params.block_sparse_mask_idx = nullptr;
+        params.block_sparse_full_cnt = nullptr;
+        params.block_sparse_full_offset = nullptr;
+        params.block_sparse_full_idx = nullptr;
+        params.block_sparse_num_blocks = 0;
+        params.block_sparse_num_heads = 0;
+        params.block_sparse_num_batches = 0;
+        params.mask_func_ptr = nullptr;
+        params.func_seqlen = 0;
+        params.arbitrary_func_num = 0;
+        params.func_head = 0;
+        params.func_batch = 0;
+        params.func_batch_stride = 0;
+        params.func_head_stride = 0;
+        params.func_nfunc_stride = 0;
+    }
+
     params.pagedkv_tma = get_pagedkv_tma(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    if (params.is_arbitrary) {
+        TORCH_CHECK(params.num_splits == 1, "Arbitrary-mask forward currently requires num_splits == 1.");
+        TORCH_CHECK(!params.pack_gqa, "Arbitrary-mask forward does not support pack_gqa.");
+    }
 
     // This needs to be set after get_num_splits
     at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
     // We don't use the persistent scheduler if Split and not Varlen
     bool const scheduler_needs_semaphore = params.arch >= 90
-        ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
+        ? (((params.is_causal || params.is_local || params.is_arbitrary) && (params.num_splits == 1)) || is_varlen)
         : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
     params.varlen_sort_batches = !params.is_local; // Use this value for Sort in scheduler template
     params.head_swizzle = params.is_causal || params.is_local; // Use this value for LPT in scheduler template
@@ -1101,6 +1275,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
     at::Tensor learnable_sink;
     if (learnable_sink_.has_value()) {
+        #ifdef FLASHATTENTION_DISABLE_SINK
+        TORCH_CHECK(false, "This flash-attention build was compiled with FLASHATTENTION_DISABLE_SINK; rebuild without it to use learnable_sink.");
+        #endif
         learnable_sink = learnable_sink_.value().to(torch::kFloat32);
         CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
         TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
@@ -1132,6 +1309,15 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         params.oaccum_head_stride = out_accum.stride(-3);
         params.lseaccum_split_stride = softmax_lse_accum.stride(0);
         params.lseaccum_head_stride = softmax_lse_accum.stride(-2);
+    } else if (params.is_arbitrary) {
+        out_accum = !is_varlen_q
+            ? torch::zeros({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(outaccum_type))
+            : torch::zeros({total_q, num_heads, head_size_v}, opts.dtype(outaccum_type));
+        params.oaccum_ptr = out_accum.data_ptr();
+        params.oaccum_split_stride = 0;
+        params.oaccum_row_stride = out_accum.stride(-3);
+        params.oaccum_head_stride = out_accum.stride(-2);
+        params.oaccum_batch_stride = !is_varlen_q ? out_accum.stride(0) : 0;
     }
 
     if (q_type == at::ScalarType::Float8_e4m3fn) {
@@ -1222,56 +1408,97 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     TORCH_CHECK(false, "Flash-Attention was built with backward disabled");
 }
 #else
-template <int Arch, bool Has_softcap>
+template <int Arch, bool Has_softcap, int kNFunc>
 void run_mha_bwd_constexpr(Flash_bwd_params &params, cudaStream_t stream) {
+    if constexpr (kNFunc > 0) {
+        TORCH_CHECK(!Has_softcap, "Arbitrary-mask backward does not support softcap.");
+        TORCH_CHECK(params.is_bf16, "Arbitrary-mask backward only supports bf16.");
+        #ifndef FLASHATTENTION_DISABLE_HDIM64
+        if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, false, kNFunc>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM256
+        if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, false, kNFunc>(params, stream); }
+        #endif
+        TORCH_CHECK(
+            false,
+            "Arbitrary-mask backward only supports bf16 with head_dim 64 or 256."
+        );
+    }
     if (!params.is_bf16) {
         #ifndef FLASHATTENTION_DISABLE_FP16
         #ifndef FLASHATTENTION_DISABLE_HDIM64
-        if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::half_t, 64, Has_softcap>(params, stream); }
+        if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::half_t, 64, Has_softcap, kNFunc>(params, stream); }
         #endif
         #ifndef FLASHATTENTION_DISABLE_HDIM96
-        if (params.d_rounded == 96) { return run_mha_bwd_<Arch, cutlass::half_t, 96, Has_softcap>(params, stream); }
+        if (params.d_rounded == 96) { return run_mha_bwd_<Arch, cutlass::half_t, 96, Has_softcap, kNFunc>(params, stream); }
         #endif
         #ifndef FLASHATTENTION_DISABLE_HDIM128
-        if (params.d_rounded == 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128, Has_softcap>(params, stream); }
+        if (params.d_rounded == 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128, Has_softcap, kNFunc>(params, stream); }
         #endif
         #ifndef FLASHATTENTION_DISABLE_HDIM192
-        if (params.d_rounded == 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap>(params, stream); }
+        if (params.d_rounded == 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap, kNFunc>(params, stream); }
         #endif
         #ifndef FLASHATTENTION_DISABLE_HDIM256
-        if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256, Has_softcap>(params, stream); }
+        if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256, Has_softcap, kNFunc>(params, stream); }
         #endif
         #else
         TORCH_CHECK(false, "This flash attention build does not support FP16.");
         #endif
     } else {
         #ifndef FLASHATTENTION_DISABLE_HDIM64
-        if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Has_softcap>(params, stream); }
+        if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Has_softcap, kNFunc>(params, stream); }
         #endif
         #ifndef FLASHATTENTION_DISABLE_HDIM96
-        if (params.d_rounded == 96) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 96, Has_softcap>(params, stream); }
+        if (params.d_rounded == 96) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 96, Has_softcap, kNFunc>(params, stream); }
         #endif
         #ifndef FLASHATTENTION_DISABLE_HDIM128
-        if (params.d_rounded == 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Has_softcap>(params, stream); }
+        if (params.d_rounded == 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Has_softcap, kNFunc>(params, stream); }
         #endif
         #ifndef FLASHATTENTION_DISABLE_HDIM192
-        if (params.d_rounded == 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap>(params, stream); }
+        if (params.d_rounded == 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap, kNFunc>(params, stream); }
         #endif
         #ifndef FLASHATTENTION_DISABLE_HDIM256
-        if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap>(params, stream); }
+        if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap, kNFunc>(params, stream); }
         #endif
     }
 }
 
+std::tuple<int64_t, int64_t> get_arbitrary_block_size(int64_t head_dim, bool is_backward) {
+    int const head_size_rounded = round_up_headdim(head_dim);
+    TORCH_CHECK(
+        head_size_rounded == 64 || head_size_rounded == 256,
+        "Arbitrary-mask kernels currently support head_dim 64 or 256 only."
+    );
+    if (is_backward) {
+        auto tile_size = tile_size_bwd_sm90(
+            head_size_rounded,
+            false,  // is_causal
+            false,  // is_local
+            true,   // is_arbitrary
+            false   // has_softcap
+        );
+        return {std::get<0>(tile_size), std::get<1>(tile_size)};
+    }
+    auto tile_size = tile_size_fwd_sm90(
+        head_size_rounded,
+        head_size_rounded,
+        false,  // is_causal
+        false,  // is_local
+        true,   // is_arbitrary
+        2,      // bf16 element size
+        false,  // v_colmajor
+        false,  // paged_kv_non_TMA
+        false   // softcap
+    );
+    return {std::get<0>(tile_size), std::get<1>(tile_size)};
+}
+
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
-        // FP16_SWITCH(!params.is_bf16, [&] {
-        //     HEADDIM_SWITCH(params.d, [&] {
-        //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
-        //     });
-        // });
     ARCH_SWITCH(params.arch, Arch, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
-            run_mha_bwd_constexpr<Arch, Has_softcap>(params, stream);
+            NFUNC_SWITCH(params.is_arbitrary, params.arbitrary_func_num, kNFunc, [&] {
+                run_mha_bwd_constexpr<Arch, Has_softcap, kNFunc>(params, stream);
+            });
         });
     });
 }
@@ -1308,7 +1535,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     bool deterministic,
     int64_t sm_margin,
     std::optional<at::Tensor> learnable_sink_,
-    std::optional<at::Tensor> dsink_
+    std::optional<at::Tensor> dsink_,
+    std::optional<at::Tensor> out_accum_,
+    std::optional<at::Tensor> arbitrary_func_,
+    std::optional<at::Tensor> block_sparse_mask_cnt_,
+    std::optional<at::Tensor> block_sparse_mask_offset_,
+    std::optional<at::Tensor> block_sparse_mask_idx_,
+    std::optional<at::Tensor> block_sparse_full_cnt_,
+    std::optional<at::Tensor> block_sparse_full_offset_,
+    std::optional<at::Tensor> block_sparse_full_idx_
 ) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1390,26 +1625,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     int const head_size_rounded = round_up_headdim(std::max(head_size, head_size_v));
     int const head_size_v_rounded = head_size_rounded;
     TORCH_CHECK(!deterministic || head_size_rounded < 256, "Deterministic backward not supported for hdim 256.");
-    // Very important that these match the kernel configs
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-    int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
-        : (head_size_rounded <= 96 ? 64
-           : (head_size_rounded <= 128 ? (is_causal || is_local || softcap > 0.0 ? 64 : 80)
-              : 64));
-    int const kBlockM_sm80 = head_size_rounded <= 64 ? 128 : 64;
-    int const kBlockM_sm86 = head_size_rounded <= 192 ? 64 : 32;
-    int const kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
-    int const kBlockN_sm90 = head_size_rounded <= 128
-        ? 128
-        : (head_size_rounded <= 192 ? 96 : 80);
-    int const kBlockN_sm80 = head_size_rounded <= 128
-        ? 128
-        : (head_size_rounded <= 192 ? 80 : 64);
-    int const kBlockN_sm86 = head_size_rounded <= 64 ? 128
-        : (head_size_rounded <= 96 ? 128
-           : (head_size_rounded <= 128 ? 96
-              : (head_size_rounded <= 192 ? 64 : 64)));
-    int const kBlockN = arch >= 90 ? kBlockN_sm90 : (arch == 86 || arch == 89 ? kBlockN_sm86 : kBlockN_sm80);
+    bool const is_arbitrary = arbitrary_func_.has_value();
+    auto const tile_size_sm90 = tile_size_bwd_sm90(head_size_rounded, is_causal, is_local, is_arbitrary, softcap > 0.0);
+    auto const tile_size_sm86 = tile_size_bwd_sm8x(true /*sm86_or_89*/, head_size_rounded, is_causal, is_local, is_arbitrary, softcap > 0.0);
+    auto const tile_size_sm80 = tile_size_bwd_sm8x(false /*sm86_or_89*/, head_size_rounded, is_causal, is_local, is_arbitrary, softcap > 0.0);
+    int const kBlockM = arch >= 90 ? std::get<0>(tile_size_sm90) : (arch == 86 || arch == 89 ? std::get<0>(tile_size_sm86) : std::get<0>(tile_size_sm80));
+    int const kBlockN = arch >= 90 ? std::get<1>(tile_size_sm90) : (arch == 86 || arch == 89 ? std::get<1>(tile_size_sm86) : std::get<1>(tile_size_sm80));
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     int const seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
     int const seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);
@@ -1554,6 +1776,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
 
     at::Tensor learnable_sink;
     if (learnable_sink_.has_value()) {
+        #ifdef FLASHATTENTION_DISABLE_SINK
+        TORCH_CHECK(false, "This flash-attention build was compiled with FLASHATTENTION_DISABLE_SINK; rebuild without it to use learnable_sink.");
+        #endif
         learnable_sink = learnable_sink_.value().to(torch::kFloat32);
         CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
         TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
@@ -1572,6 +1797,140 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     } else {
         params.learnable_sink_ptr = nullptr;
         params.dsink_ptr = nullptr;
+    }
+
+    if (out_accum_.has_value()) {
+        auto out_accum = out_accum_.value();
+        if (out_accum.defined() && out_accum.numel() > 0) {
+            TORCH_CHECK(out_accum.dtype() == at::ScalarType::Float, "out_accum must have dtype fp32");
+            CHECK_DEVICE(out_accum);
+            TORCH_CHECK(out_accum.stride(-1) == 1, "out_accum tensor must have contiguous last dimension");
+            if (!is_varlen_q) {
+                CHECK_SHAPE(out_accum, batch_size, seqlen_q, num_heads, head_size_v);
+            } else {
+                CHECK_SHAPE(out_accum, total_q, num_heads, head_size_v);
+            }
+            params.oaccum_ptr = out_accum.data_ptr();
+            params.oaccum_row_stride = out_accum.stride(-3);
+            params.oaccum_head_stride = out_accum.stride(-2);
+            params.oaccum_batch_stride = !is_varlen_q ? out_accum.stride(0) : 0;
+        }
+    }
+
+    params.is_arbitrary = is_arbitrary;
+    if (params.is_arbitrary) {
+        auto arbitrary_func = arbitrary_func_.value();
+        CHECK_DEVICE(arbitrary_func); CHECK_CONTIGUOUS(arbitrary_func);
+        TORCH_CHECK(arbitrary_func.dtype() == torch::kInt32, "arbitrary_func must have dtype int32");
+        TORCH_CHECK(arbitrary_func.dim() == 4, "arbitrary_func must be 4D [batch, head_q, func_num, seqlen_q+256]");
+        TORCH_CHECK(arbitrary_func.size(2) % 2 == 1, "arbitrary_func func_num must be odd");
+        TORCH_CHECK(arbitrary_func.size(2) <= FLASHATTENTION_MAX_NUM_FUNC,
+                    "arbitrary_func func_num must be <= FLASHATTENTION_MAX_NUM_FUNC");
+        TORCH_CHECK(
+            arbitrary_func.size(3) >= seqlen_q + 256,
+            "arbitrary_func seqlen_q dimension must be >= seqlen_q + 256"
+        );
+        params.mask_func_ptr = arbitrary_func.data_ptr<int>();
+        params.func_seqlen = arbitrary_func.size(3);
+        params.arbitrary_func_num = arbitrary_func.size(2);
+        params.func_head = arbitrary_func.size(1);
+        params.func_batch = arbitrary_func.size(0);
+        params.func_batch_stride = arbitrary_func.stride(0);
+        params.func_head_stride = arbitrary_func.stride(1);
+        params.func_nfunc_stride = arbitrary_func.stride(2);
+    } else {
+        params.mask_func_ptr = nullptr;
+        params.func_seqlen = 0;
+        params.arbitrary_func_num = 0;
+        params.func_head = 0;
+        params.func_batch = 0;
+        params.func_batch_stride = 0;
+        params.func_head_stride = 0;
+        params.func_nfunc_stride = 0;
+    }
+
+    bool use_block_sparsity = block_sparse_mask_cnt_.has_value() &&
+                              block_sparse_mask_offset_.has_value() &&
+                              block_sparse_mask_idx_.has_value() &&
+                              block_sparse_full_cnt_.has_value() &&
+                              block_sparse_full_offset_.has_value() &&
+                              block_sparse_full_idx_.has_value();
+    params.use_block_sparsity = use_block_sparsity;
+
+    TORCH_CHECK(
+        !params.is_arbitrary || use_block_sparsity,
+        "Arbitrary-mask backward requires the 6 k2q block-sparse tensors"
+    );
+
+    if (use_block_sparsity) {
+        auto block_sparse_mask_cnt = block_sparse_mask_cnt_.value();
+        auto block_sparse_mask_offset = block_sparse_mask_offset_.value();
+        auto block_sparse_mask_idx = block_sparse_mask_idx_.value();
+        auto block_sparse_full_cnt = block_sparse_full_cnt_.value();
+        auto block_sparse_full_offset = block_sparse_full_offset_.value();
+        auto block_sparse_full_idx = block_sparse_full_idx_.value();
+
+        CHECK_DEVICE(block_sparse_mask_cnt); CHECK_CONTIGUOUS(block_sparse_mask_cnt);
+        CHECK_DEVICE(block_sparse_mask_offset); CHECK_CONTIGUOUS(block_sparse_mask_offset);
+        CHECK_DEVICE(block_sparse_mask_idx); CHECK_CONTIGUOUS(block_sparse_mask_idx);
+        CHECK_DEVICE(block_sparse_full_cnt); CHECK_CONTIGUOUS(block_sparse_full_cnt);
+        CHECK_DEVICE(block_sparse_full_offset); CHECK_CONTIGUOUS(block_sparse_full_offset);
+        CHECK_DEVICE(block_sparse_full_idx); CHECK_CONTIGUOUS(block_sparse_full_idx);
+
+        TORCH_CHECK(block_sparse_mask_cnt.dtype() == torch::kInt32, "block_sparse_mask_cnt must have dtype int32");
+        TORCH_CHECK(block_sparse_mask_offset.dtype() == torch::kInt32, "block_sparse_mask_offset must have dtype int32");
+        TORCH_CHECK(block_sparse_mask_idx.dtype() == torch::kInt32, "block_sparse_mask_idx must have dtype int32");
+        TORCH_CHECK(block_sparse_full_cnt.dtype() == torch::kInt32, "block_sparse_full_cnt must have dtype int32");
+        TORCH_CHECK(block_sparse_full_offset.dtype() == torch::kInt32, "block_sparse_full_offset must have dtype int32");
+        TORCH_CHECK(block_sparse_full_idx.dtype() == torch::kInt32, "block_sparse_full_idx must have dtype int32");
+
+        TORCH_CHECK(block_sparse_mask_cnt.dim() == 3, "block_sparse_mask_cnt must be 3D [B, H, num_n_blocks]");
+        TORCH_CHECK(block_sparse_full_cnt.dim() == 3, "block_sparse_full_cnt must be 3D [B, H, num_n_blocks]");
+        TORCH_CHECK(block_sparse_mask_offset.dim() == 1, "block_sparse_mask_offset must be 1D");
+        TORCH_CHECK(block_sparse_full_offset.dim() == 1, "block_sparse_full_offset must be 1D");
+        TORCH_CHECK(block_sparse_mask_idx.dim() == 1, "block_sparse_mask_idx must be 1D");
+        TORCH_CHECK(block_sparse_full_idx.dim() == 1, "block_sparse_full_idx must be 1D");
+
+        TORCH_CHECK(
+            block_sparse_mask_cnt.size(0) == batch_size || block_sparse_mask_cnt.size(0) == 1,
+            "block_sparse_mask_cnt batch dimension must be 1 or batch size"
+        );
+        TORCH_CHECK(
+            block_sparse_mask_cnt.size(1) == num_heads || block_sparse_mask_cnt.size(1) == 1,
+            "block_sparse_mask_cnt head dimension must be 1 or num_heads"
+        );
+        TORCH_CHECK(
+            block_sparse_mask_offset.size(0) == block_sparse_mask_cnt.numel() + 1,
+            "block_sparse_mask_offset size must be block_sparse_mask_cnt.numel() + 1"
+        );
+        TORCH_CHECK(
+            block_sparse_full_offset.size(0) == block_sparse_full_cnt.numel() + 1,
+            "block_sparse_full_offset size must be block_sparse_full_cnt.numel() + 1"
+        );
+        TORCH_CHECK(
+            block_sparse_mask_cnt.sizes() == block_sparse_full_cnt.sizes(),
+            "block_sparse mask/full cnt tensors must have the same shape"
+        );
+
+        params.block_sparse_mask_cnt = block_sparse_mask_cnt.data_ptr<int>();
+        params.block_sparse_mask_offset = block_sparse_mask_offset.data_ptr<int>();
+        params.block_sparse_mask_idx = block_sparse_mask_idx.data_ptr<int>();
+        params.block_sparse_full_cnt = block_sparse_full_cnt.data_ptr<int>();
+        params.block_sparse_full_offset = block_sparse_full_offset.data_ptr<int>();
+        params.block_sparse_full_idx = block_sparse_full_idx.data_ptr<int>();
+        params.block_sparse_num_blocks = block_sparse_mask_cnt.size(2);
+        params.block_sparse_num_heads = block_sparse_mask_cnt.size(1);
+        params.block_sparse_num_batches = block_sparse_mask_cnt.size(0);
+    } else {
+        params.block_sparse_mask_cnt = nullptr;
+        params.block_sparse_mask_offset = nullptr;
+        params.block_sparse_mask_idx = nullptr;
+        params.block_sparse_full_cnt = nullptr;
+        params.block_sparse_full_offset = nullptr;
+        params.block_sparse_full_idx = nullptr;
+        params.block_sparse_num_blocks = 0;
+        params.block_sparse_num_heads = 0;
+        params.block_sparse_num_batches = 0;
     }
 
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
@@ -1722,6 +2081,7 @@ mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen 
 }
 
 TORCH_LIBRARY(flash_attn_3, m) {
+    m.def("get_arbitrary_block_size(int head_dim, bool is_backward) -> (int, int)");
     m.def("fwd("
         "Tensor q,"
         "Tensor k,"
@@ -1757,7 +2117,14 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
         "int sm_margin = 0,"
-        "Tensor? learnable_sink = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "Tensor? learnable_sink = None,"
+        "Tensor? block_sparse_mask_cnt = None,"
+        "Tensor? block_sparse_mask_offset = None,"
+        "Tensor? block_sparse_mask_idx = None,"
+        "Tensor? block_sparse_full_cnt = None,"
+        "Tensor? block_sparse_full_offset = None,"
+        "Tensor? block_sparse_full_idx = None,"
+        "Tensor? arbitrary_func = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
@@ -1782,7 +2149,15 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "bool deterministic = False,"
         "int sm_margin = 0,"
         "Tensor? learnable_sink = None,"
-        "Tensor? dsink = None) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "Tensor? dsink = None,"
+        "Tensor? out_accum = None,"
+        "Tensor? arbitrary_func = None,"
+        "Tensor? block_sparse_mask_cnt = None,"
+        "Tensor? block_sparse_mask_offset = None,"
+        "Tensor? block_sparse_mask_idx = None,"
+        "Tensor? block_sparse_full_cnt = None,"
+        "Tensor? block_sparse_full_offset = None,"
+        "Tensor? block_sparse_full_idx = None) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"
@@ -1820,4 +2195,8 @@ TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
     m.impl("bwd", &mha_bwd);
     m.impl("fwd_combine", &mha_combine);
     m.impl("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata);
+}
+
+TORCH_LIBRARY_IMPL(flash_attn_3, CatchAll, m) {
+    m.impl("get_arbitrary_block_size", &get_arbitrary_block_size);
 }

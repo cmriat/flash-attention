@@ -66,11 +66,16 @@ DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
 DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 DISABLE_SINK = os.getenv("FLASH_ATTENTION_DISABLE_SINK", "FALSE") == "TRUE"
+DISABLE_ARBITRARY = os.getenv("FLASH_ATTENTION_DISABLE_ARBITRARY", "FALSE") == "TRUE"
 
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
 
 DISABLE_HDIMDIFF64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF64", "FALSE") == "TRUE"
 DISABLE_HDIMDIFF192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF192", "FALSE") == "TRUE"
+
+MAX_NUM_FUNC = int(os.getenv("FLASH_ATTENTION_MAX_NUM_FUNC", "3"))
+if not DISABLE_ARBITRARY and (MAX_NUM_FUNC <= 0 or MAX_NUM_FUNC % 2 == 0):
+    raise ValueError(f"FLASH_ATTENTION_MAX_NUM_FUNC must be a positive odd number, got {MAX_NUM_FUNC}")
 
 # HACK: we monkey patch pytorch's _write_ninja_file to pass
 # "-gencode arch=compute_sm90a,code=sm_90a" to files ending in '_sm90.cu',
@@ -107,6 +112,9 @@ def create_build_config_file():
             "FLASHATTENTION_DISABLE_HDIM192": DISABLE_HDIM192,
             "FLASHATTENTION_DISABLE_HDIM256": DISABLE_HDIM256,
             "FLASHATTENTION_DISABLE_SM8x": DISABLE_SM8x,
+            "FLASHATTENTION_DISABLE_SINK": DISABLE_SINK,
+            "FLASHATTENTION_DISABLE_ARBITRARY": DISABLE_ARBITRARY,
+            "FLASH_ATTENTION_MAX_NUM_FUNC": MAX_NUM_FUNC,
             "FLASHATTENTION_ENABLE_VCOLMAJOR": ENABLE_VCOLMAJOR,
             "FLASH_ATTENTION_DISABLE_HDIMDIFF64": DISABLE_HDIMDIFF64,
             "FLASH_ATTENTION_DISABLE_HDIMDIFF192": DISABLE_HDIMDIFF192,
@@ -426,10 +434,29 @@ exe_extension = sysconfig.get_config_var("EXE")
 
 cmdclass = {}
 ext_modules = []
+
+
+def ensure_cutlass_submodule():
+    repo_dir = Path(this_dir).parent
+    cutlass_dir = repo_dir / "csrc" / "cutlass"
+    if cutlass_dir.exists():
+        return
+
+    git_dir = repo_dir / ".git"
+    if git_dir.exists() and not USE_TRITON_ROCM:
+        subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"], check=True)
+        if cutlass_dir.exists():
+            return
+
+    raise RuntimeError(
+        "Missing csrc/cutlass. Build from a clone with submodules, or vendor cutlass into the source tree."
+    )
+
+
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if not USE_TRITON_ROCM:
-    subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"])
+    ensure_cutlass_submodule()
 
 if not SKIP_CUDA_BUILD:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -522,6 +549,8 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF64"] if DISABLE_HDIMDIFF64 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF192"] if DISABLE_HDIMDIFF192 else [])
         + (["-DFLASHATTENTION_DISABLE_SINK"] if DISABLE_SINK else [])
+        + (["-DFLASHATTENTION_DISABLE_ARBITRARY"] if DISABLE_ARBITRARY else [])
+        + ([f"-DFLASHATTENTION_MAX_NUM_FUNC={MAX_NUM_FUNC}"] if not DISABLE_ARBITRARY else [])
     )
 
     DTYPE_FWD_SM80 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
@@ -593,6 +622,10 @@ if not SKIP_CUDA_BUILD:
         + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90
         + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90
     )
+    if not DISABLE_ARBITRARY:
+        sources += ["instantiations/flash_fwd_arbitrary_max_nfunc_sm90.cu"]
+        if not DISABLE_BACKWARD:
+            sources += ["instantiations/flash_bwd_arbitrary_max_nfunc_sm90.cu"]
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]
     sources += ["flash_prepare_scheduler.cu"]

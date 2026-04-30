@@ -10,9 +10,10 @@
 #include "cutlass/kernel_launch.h"  // For kernel_launch
 #include "cutlass/cluster_launch.hpp"  // For ClusterLauncher
 
-#include "cuda_check.h"
 #include "static_switch.h"
 #include "flash.h"
+#include "tile_size.h"
+#include "cuda_check.h"
 #include "flash_bwd_preprocess_kernel.h"
 #include "flash_bwd_postprocess_kernel.h"
 #include "tile_scheduler.hpp"
@@ -29,7 +30,7 @@ template <int Arch, int kHeadDim, int kBlockM, int kBlockN, typename Element,
           int Stages_dO=2, int Stages_dS_or_QSm80=2,
           bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
           int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-          bool V_in_regs=false, bool Has_sink=false>
+          bool V_in_regs=false, bool Is_arbitrary=false, int kNFunc=1, bool Has_sink=false>
 void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using ElementAccum = float;
@@ -52,6 +53,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         static_cast<Element const*>(params.o_ptr),
         {seqlen_q, params.dv, params.h, batch_q},  // shape_O
         {params.o_row_stride, _1{}, params.o_head_stride, !is_varlen_q ? params.o_batch_stride : 0},  // stride_O
+        static_cast<ElementAccum const*>(params.oaccum_ptr),
+        {params.oaccum_row_stride, _1{}, params.oaccum_head_stride, !is_varlen_q ? params.oaccum_batch_stride : 0},  // stride_O_accum
         static_cast<Element const*>(params.do_ptr),
         {params.do_row_stride, _1{}, params.do_head_stride, !is_varlen_q ? params.do_batch_stride : 0},  // stride_dO
         static_cast<float*>(params.dsoftmax_sum),
@@ -61,6 +64,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {_1{}, seqlen_q, !is_varlen_q ? params.h * params.seqlen_q : 0},  // stride_LSE
         static_cast<float*>(params.softmax_lse_log2_ptr),
         {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
+        reinterpret_cast<float const*>(params.learnable_sink_ptr),
+        reinterpret_cast<float*>(params.dsink_ptr),
         static_cast<ElementAccum*>(params.dq_accum_ptr),
         {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
         {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * seqlen_q_rounded * params.h : 0},  // stride_dQaccum
@@ -72,7 +77,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
     dim3 grid_m(num_m_block, params.h, params.b);
-    CHECK_CUTLASS(cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/));
+    cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/);
+    CHECK_CUDA_KERNEL_LAUNCH();
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<_1, Int<1>, _1>;  // Currently doesn't not support cluster
@@ -83,10 +89,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         Arch >= 90,
         flash::CollectiveMainloopBwdSm90<Stages, Stages_dO, Stages_dS, ClusterShape, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm90,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
-            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Has_sink>,
+            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Is_arbitrary, kNFunc, Has_sink>,
         flash::CollectiveMainloopBwdSm80<Stages, Stages_dO, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm80,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
-            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>
+            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Is_arbitrary, kNFunc>
     >;
     using CollectiveEpilogue = std::conditional_t<
         !GQA,
@@ -94,8 +100,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         flash::CollectiveEpilogueBwdGQA<TileShape_MNK, ElementAccum, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, Deterministic, Has_sink>
     >;
     using Scheduler = std::conditional_t<
-        Is_causal,
-        flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, Is_causal && Deterministic /*SPT*/>,
+        (Is_causal || Is_arbitrary),
+        flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, (Is_causal || Is_arbitrary) && Deterministic /*SPT*/>,
         flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>
     >;
     using AttnKernel = std::conditional_t<
@@ -132,7 +138,15 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.dq_semaphore,
         params.cu_seqlens_q, params.cu_seqlens_k,
         params.seqused_q, params.seqused_k,
-        reinterpret_cast<float const*>(params.learnable_sink_ptr)
+        reinterpret_cast<float const*>(params.learnable_sink_ptr),
+        // Block sparsity arguments (K2Q direction for backward)
+        {params.block_sparse_mask_cnt, params.block_sparse_mask_offset, params.block_sparse_mask_idx,
+         params.block_sparse_full_cnt, params.block_sparse_full_offset, params.block_sparse_full_idx,
+         params.block_sparse_num_blocks, params.block_sparse_num_heads, params.block_sparse_num_batches},
+        // Arbitrary mask function parameters
+        params.mask_func_ptr,
+        {params.func_seqlen, params.arbitrary_func_num, params.func_head, params.func_batch},  // shape_mask_func: (seqlen_q, func_num, head, batch)
+        {_1{}, params.func_nfunc_stride, params.func_head_stride, params.func_batch_stride}  // stride_mask_func
     };
     // The case work with GQA is ugly but idk how to fix it.
     typename CollectiveEpilogue::Arguments epilogue_args {
@@ -215,14 +229,15 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
         dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
-        CHECK_CUTLASS(cutlass::ClusterLauncher::launch(
-            grid_dims, cluster_dims, block_dims, smem_size, stream, kernel, kernel_params, false /*launch_with_pdl*/));
+        cutlass::ClusterLauncher::launch(
+            grid_dims, cluster_dims, block_dims, smem_size, stream, kernel, kernel_params, false /*launch_with_pdl*/);
     } else {
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<AttnKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
-        CHECK_CUTLASS(cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/));
+        cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/);
     }
+    CHECK_CUDA_KERNEL_LAUNCH();
 
     using PostprocessKernel = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_MK, Element, ElementAccum, ArchTag,
         AttnKernel::CollectiveMainloop::NumMmaThreads,
@@ -247,7 +262,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     if (smem_size_postprocess >= 48 * 1024) {
         CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
     }
-    CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/));
+    cutlass::kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/);
+    CHECK_CUDA_KERNEL_LAUNCH();
 
     if constexpr (GQA) {
         using TileShape_NK = cute::Shape<Int<kBlockN>, Int<kHeadDim>>;
@@ -286,8 +302,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         if (smem_size_postprocess >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
         }
-        CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/));
-        CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/));
+        cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/);
+        CHECK_CUDA_KERNEL_LAUNCH();
+        cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/);
+        CHECK_CUDA_KERNEL_LAUNCH();
     }
 
 }
@@ -296,15 +314,16 @@ template<int Arch, typename T, int kBlockM, int kBlockN, int kHeadDim, bool Is_c
          int Stages_dO=2, int Stages_dS_or_QSm80=2,
          bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
          int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-         bool V_in_regs=false>
+         bool V_in_regs=false, bool Is_arbitrary=false, int kNFunc=1>
 void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
     VARLEN_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
         BOOL_SWITCH(params.h != params.h_k, GQA, [&] {
-            BOOL_SWITCH(params.deterministic, Deterministic_, [&] {
-                SINK_SWITCH(params.learnable_sink_ptr != nullptr, Has_sink, [&] {
+            SINK_SWITCH(params.learnable_sink_ptr != nullptr, Has_sink_, [&] {
+                static constexpr bool Has_sink = Has_sink_;
+                BOOL_SWITCH(params.deterministic, Deterministic_, [&] {
                     static constexpr bool Deterministic = Deterministic_ && kHeadDim < 256;
                     // run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen, false, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
-                    run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, Deterministic /*Deterministic*/, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Has_sink>(params, stream);
+                    run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, Deterministic /*Deterministic*/, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Is_arbitrary, kNFunc, Has_sink>(params, stream);
                 });
             });
         });
@@ -312,81 +331,119 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 
+// Unified backward kernel launcher with kHeadDim and kNFunc as template parameters.
+// NFUNC_SWITCH dispatch is done in flash_api.cpp, so each kNFunc value compiles in a separate TU.
+template<int Arch, typename T, int kHeadDim, bool Has_softcap, int kNFunc>
+void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream) {
+    static constexpr bool Is_arbitrary = kNFunc > 0;
+    if constexpr (Is_arbitrary) {
+        FLASH_CHECK(params.arbitrary_func_num > 0 && params.arbitrary_func_num <= kNFunc && params.arbitrary_func_num % 2 == 1,
+            "Runtime arbitrary_func_num (%d) must be positive, odd, and <= compile-time max (%d). "
+            "Please rebuild with a larger FLASH_ATTENTION_MAX_NUM_FUNC if needed",
+            params.arbitrary_func_num, kNFunc);
+        // Get all configuration from tile_size.h (single source of truth) - same pattern as forward
+        // Returns {kBlockM, kBlockN, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
+        //          NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs}
+        static constexpr auto kConfig = Arch >= 90
+            ? tile_size_bwd_sm90(kHeadDim, false, false, Is_arbitrary, Has_softcap)
+            : tile_size_bwd_sm8x(Arch == 86 || Arch == 89, kHeadDim, false, false, Is_arbitrary, Has_softcap);
+
+        static constexpr int kBlockM = std::get<0>(kConfig);
+        static constexpr int kBlockN = std::get<1>(kConfig);
+        static constexpr int Stages_dO = std::get<2>(kConfig);
+        static constexpr int Stages_dS = std::get<3>(kConfig);
+        static constexpr bool SdP_swapAB = std::get<4>(kConfig);
+        static constexpr bool dKV_swapAB = std::get<5>(kConfig);
+        static constexpr bool dQ_swapAB = std::get<6>(kConfig);
+        static constexpr int NumMmaWarpGroups = std::get<7>(kConfig);
+        static constexpr int AtomLayoutMSdP = std::get<8>(kConfig);
+        static constexpr int AtomLayoutNdKV = std::get<9>(kConfig);
+        static constexpr int AtomLayoutMdQ = std::get<10>(kConfig);
+        static constexpr bool V_in_regs = std::get<11>(kConfig);
+
+        run_mha_bwd_dispatch<Arch, T, kBlockM, kBlockN, kHeadDim, false, false, Has_softcap,
+            Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
+            NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+            V_in_regs, Is_arbitrary, kNFunc>(params, stream);
+    } else {
+        CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
+            // Get all configuration from tile_size.h (single source of truth) - same pattern as forward
+            // Returns {kBlockM, kBlockN, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
+            //          NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs}
+            static constexpr auto kConfig = Arch >= 90
+                ? tile_size_bwd_sm90(kHeadDim, Is_causal, Is_local, Is_arbitrary, Has_softcap)
+                : tile_size_bwd_sm8x(Arch == 86 || Arch == 89, kHeadDim, Is_causal, Is_local, Is_arbitrary, Has_softcap);
+
+            static constexpr int kBlockM = std::get<0>(kConfig);
+            static constexpr int kBlockN = std::get<1>(kConfig);
+            static constexpr int Stages_dO = std::get<2>(kConfig);
+            static constexpr int Stages_dS = std::get<3>(kConfig);
+            static constexpr bool SdP_swapAB = std::get<4>(kConfig);
+            static constexpr bool dKV_swapAB = std::get<5>(kConfig);
+            static constexpr bool dQ_swapAB = std::get<6>(kConfig);
+            static constexpr int NumMmaWarpGroups = std::get<7>(kConfig);
+            static constexpr int AtomLayoutMSdP = std::get<8>(kConfig);
+            static constexpr int AtomLayoutNdKV = std::get<9>(kConfig);
+            static constexpr int AtomLayoutMdQ = std::get<10>(kConfig);
+            static constexpr bool V_in_regs = std::get<11>(kConfig);
+
+            run_mha_bwd_dispatch<Arch, T, kBlockM, kBlockN, kHeadDim, Is_causal, Is_local, Has_softcap,
+                Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
+                NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+                V_in_regs, Is_arbitrary, kNFunc>(params, stream);
+        });
+    }
+}
+
 template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
-    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        if constexpr (Arch >= 90) {
-            if constexpr (Is_causal && Has_softcap) {
-                // register spill with 128 x 128
-                run_mha_bwd_dispatch<Arch, T, 96, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 2, false>(params, stream);
-            } else {
-                // With ShuffleStats we no longer have register spilling when Has_softcap and using 128 x 128 block.
-                run_mha_bwd_dispatch<Arch, T, 128, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 2, false>(params, stream);
-            }
-        } else if constexpr (Arch == 86 || Arch == 89) {
-            run_mha_bwd_dispatch<Arch, T, 64, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, false, false, false, 2, 2, 4, 2, true>(params, stream);
-            // run_mha_bwd_dispatch<Arch, T, 96, 96, 64, Is_causal, Is_local, Has_softcap, 1, 2, false, true, true, 2, 2, 4, 4, false>(params, stream);
-            // run_mha_bwd_dispatch<Arch, T, 80, 128, 64, Is_causal, Is_local, Has_softcap, 1, 2, true, false, true, 2, 2, 4, 2, true>(params, stream);
-            // run_mha_bwd_dispatch<Arch, T, 96, 128, 64, Is_causal, Is_local, Has_softcap, 1, 2, true, false, true, 2, 1, 8, 4, false>(params, stream);
-        } else {
-            run_mha_bwd_dispatch<Arch, T, 128, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, false, false, false, 2, 4, 4, 4, false>(params, stream);
-        }
-    });
+    run_mha_bwd_<Arch, T, 64, Has_softcap, 0>(params, stream);
 }
 
 template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         if constexpr (Arch >= 90) {
-            run_mha_bwd_dispatch<Arch, T, 64, 128, 96, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1, true>(params, stream);
+            run_mha_bwd_dispatch<Arch, T, 64, 128, 96, Is_causal, Is_local, Has_softcap,
+                                 2, 2, true, false, false, 2, 1, 2, 1, true,
+                                 false, 0>(params, stream);
         } else if constexpr (Arch == 86 || Arch == 89) {
-            run_mha_bwd_dispatch<Arch, T, 64, 128, 96, Is_causal, Is_local, Has_softcap, 1, 2, false, false, false, 2, 2, 4, 2, true>(params, stream);
+            run_mha_bwd_dispatch<Arch, T, 64, 128, 96, Is_causal, Is_local, Has_softcap,
+                                 1, 2, false, false, false, 2, 2, 4, 2, true,
+                                 false, 0>(params, stream);
         } else {
-            run_mha_bwd_dispatch<Arch, T, 64, 128, 96, Is_causal, Is_local, Has_softcap, 2, 2, false, false, false, 2, 2, 4, 2, false>(params, stream);
+            run_mha_bwd_dispatch<Arch, T, 64, 128, 96, Is_causal, Is_local, Has_softcap,
+                                 2, 2, false, false, false, 2, 2, 4, 2, false,
+                                 false, 0>(params, stream);
         }
     });
 }
 
 template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
-    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        if constexpr (Arch >= 90) {
-            if constexpr (Is_causal || Is_local || Has_softcap) {
-                run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1, false>(params, stream);
-            } else {
-                run_mha_bwd_dispatch<Arch, T, 80, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1, false>(params, stream);
-            }
-        } else if constexpr (Arch == 86 || Arch == 89) {
-            run_mha_bwd_dispatch<Arch, T, 64, 96, 128, Is_causal, Is_local, Has_softcap, 1, 2, false, false, false, 2, 2, 2, 2, true>(params, stream);
-        } else {
-            run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, false, false, false, 2, 2, 2, 2, false>(params, stream);
-        }
-    });
+    run_mha_bwd_<Arch, T, 128, Has_softcap, 0>(params, stream);
 }
 
 template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         if constexpr (Arch >= 90) {
-            run_mha_bwd_dispatch<Arch, T, 64, 96, 192, Is_causal, Is_local, Has_softcap, 1, 1, false, true, false, 3, 1, 1, 1, false>(params, stream);
+            run_mha_bwd_dispatch<Arch, T, 64, 96, 192, Is_causal, Is_local, Has_softcap,
+                                 1, 1, false, true, false, 3, 1, 1, 1, false,
+                                 false, 0>(params, stream);
         } else if constexpr (Arch == 86 || Arch == 89) {
-            run_mha_bwd_dispatch<Arch, T, 64, 64, 192, Is_causal, Is_local, Has_softcap, 1, 1, false, false, false, 2, 2, 2, 2, true>(params, stream);
+            run_mha_bwd_dispatch<Arch, T, 64, 64, 192, Is_causal, Is_local, Has_softcap,
+                                 1, 1, false, false, false, 2, 2, 2, 2, true,
+                                 false, 0>(params, stream);
         } else {
-            run_mha_bwd_dispatch<Arch, T, 64, 80, 192, Is_causal, Is_local, Has_softcap, 1, 2, false, true, false, 2, 4, 2, 2, false>(params, stream);
+            run_mha_bwd_dispatch<Arch, T, 64, 80, 192, Is_causal, Is_local, Has_softcap,
+                                 1, 2, false, true, false, 2, 4, 2, 2, false,
+                                 false, 0>(params, stream);
         }
     });
 }
 
 template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
-    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        if constexpr (Arch >= 90) {
-            run_mha_bwd_dispatch<Arch, T, 64, 80, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, true, true, 2, 1, 1, 1, false>(params, stream);
-        } else if constexpr (Arch == 86 || Arch == 89) {
-            run_mha_bwd_dispatch<Arch, T, 32, 64, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, false, false, 2, 2, 2, 1, true>(params, stream);
-            // run_mha_bwd_dispatch<Arch, T, 64, 32, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, false, false, 2, 4, 1, 2, true>(params, stream);
-        } else {
-            run_mha_bwd_dispatch<Arch, T, 64, 64, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, false, false, 2, 4, 2, 2, false>(params, stream);
-        }
-    });
+    run_mha_bwd_<Arch, T, 256, Has_softcap, 0>(params, stream);
 }
